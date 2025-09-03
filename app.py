@@ -1,5 +1,6 @@
-# app.py — Quality Portal - Pilot
-# First Piece (manual upload) + Non-Conformities (manual + CSV) + Search/View/Export
+# app.py  — Quality Portal - Pilot
+# Streamlit app: models, first-piece, non-conformities, search, import, and export
+# Storage is cloud-safe: /mount/data if present, else /tmp/qc_portal
 
 import os
 import io
@@ -8,459 +9,611 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
 from PIL import Image
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Storage
+# Safe storage
 # ──────────────────────────────────────────────────────────────────────────────
-def pick_data_dir() -> Path:
-    for base in (Path("/mount/data"), Path("/tmp/quality_portal")):
+def _pick_data_dir() -> Path:
+    for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
         try:
             base.mkdir(parents=True, exist_ok=True)
-            (base / ".ok").write_text("ok", encoding="utf-8")
+            (base / ".write_ok").write_text("ok", encoding="utf-8")
             return base
         except Exception:
             pass
-    raise RuntimeError("No writable directory available")
+    raise RuntimeError("No writable directory found")
 
-DATA_DIR = pick_data_dir()
-IMG_DIR  = DATA_DIR / "images"
-IMG_DIR.mkdir(exist_ok=True, parents=True)
-DB_PATH  = DATA_DIR / "quality_portal.sqlite3"
+DATA_DIR = _pick_data_dir()
+IMG_DIR  = DATA_DIR / "images"       # /images/<bucket>/<model>/...
+DB_PATH  = DATA_DIR / "qc_portal.sqlite3"
+IMG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
 
 def cur_user() -> str:
+    # Best-effort Streamlit user OR default admin
     return os.environ.get("USERNAME") or os.environ.get("USER") or "Admin1"
 
-def today_iso() -> str:
-    return date.today().isoformat()
-
-# Save uploaded image to images/<sub>/<timestamp>_<orig>
-def save_image(file, sub: str) -> str:
-    subdir = IMG_DIR / sub
-    subdir.mkdir(parents=True, exist_ok=True)
+def _save_image(bucket: str, model_no: str, uploaded_file) -> str:
+    """
+    Save under images/<bucket>/<model_no> and return PATH RELATIVE TO DATA_DIR.
+    """
+    clean_name = uploaded_file.name.replace(" ", "_")
+    folder = IMG_DIR / bucket / (model_no or "unknown")
+    folder.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    safe = file.name.replace(" ", "_")
-    out = subdir / f"{ts}_{safe}"
-    # re-encode as JPEG to be consistent
-    img = Image.open(file).convert("RGB")
-    img.save(out, format="JPEG", quality=90)
-    return str(out.relative_to(DATA_DIR))
+    out_path = folder / f"{ts}_{clean_name}"
+    img = Image.open(uploaded_file).convert("RGB")
+    img.save(out_path, format="JPEG", quality=90)
+    return str(out_path.relative_to(DATA_DIR))  # stored as relative path
+
+def _path_if_exists(rel: str | None) -> Path | None:
+    if not rel:
+        return None
+    p = DATA_DIR / rel
+    return p if p.exists() else None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB schema + migrations
+# Database
 # ──────────────────────────────────────────────────────────────────────────────
-TABLE_FP = "first_piece"
-TABLE_NC = "non_conformities"
-
-SCHEMA_FP = f"""
-CREATE TABLE IF NOT EXISTS {TABLE_FP}(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at   TEXT,
-  model_no     TEXT,
-  model_version TEXT,
-  sn           TEXT,
-  mo           TEXT,
-  description  TEXT,
-  reporter     TEXT,
-  top_path     TEXT,
-  bottom_path  TEXT
+SCHEMA_MODELS = """
+CREATE TABLE IF NOT EXISTS models(
+  model_no TEXT PRIMARY KEY,
+  name     TEXT
 );
 """
 
-SCHEMA_NC = f"""
-CREATE TABLE IF NOT EXISTS {TABLE_NC}(
+SCHEMA_FIRSTPIECE = """
+CREATE TABLE IF NOT EXISTS firstpiece(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at   TEXT,
   model_no     TEXT,
   model_version TEXT,
   sn           TEXT,
   mo           TEXT,
-  nc_type      TEXT,
-  description  TEXT,
-  category     TEXT,
-  line         TEXT,
-  station      TEXT,
   reporter     TEXT,
-  month        TEXT,
-  week         TEXT,
-  customer     TEXT,
+  desc_text    TEXT,
+  top_path     TEXT,
+  bottom_path  TEXT,
   extra        JSON
+);
+"""
+
+SCHEMA_NONCONF = """
+CREATE TABLE IF NOT EXISTS nonconf(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at   TEXT,       -- date/time (from file or now)
+  model_no     TEXT,       -- short model code
+  model_version TEXT,      -- full model/part no
+  mo           TEXT,       -- MO/PO
+  sn           TEXT,       -- Serial/Barcode
+  customer     TEXT,       -- customer/supplier
+  line         TEXT,
+  workstation  TEXT,
+  unit_head    TEXT,
+  nc_type      TEXT,       -- category/type
+  description  TEXT,       -- description of nonconformity
+  root_cause   TEXT,
+  corrective_action TEXT,
+  responsibility TEXT,
+  defect_outflow TEXT,
+  defect_item  TEXT,
+  defect_qty   TEXT,
+  inspection_qty TEXT,
+  lot_qty      TEXT,
+  reporter     TEXT,
+  photo_path   TEXT,
+  extra        JSON        -- JSON for unmapped columns
 );
 """
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
-def _cols(c, table: str) -> set:
-    return {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
-
-def _ensure(c, table, col, decl, default=None):
-    if col not in _cols(c, table):
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-        if default is not None:
-            c.execute(f"UPDATE {table} SET {col}=?", (default,))
-
 def init_db():
     with get_conn() as c:
-        c.execute(SCHEMA_FP)
-        c.execute(SCHEMA_NC)
-        # simple migrations (add missing columns safely)
-        for tbl, cols in {
-            TABLE_FP: {
-                "created_at":"TEXT","model_no":"TEXT","model_version":"TEXT","sn":"TEXT",
-                "mo":"TEXT","description":"TEXT","reporter":"TEXT","top_path":"TEXT","bottom_path":"TEXT"
-            },
-            TABLE_NC: {
-                "created_at":"TEXT","model_no":"TEXT","model_version":"TEXT","sn":"TEXT","mo":"TEXT",
-                "nc_type":"TEXT","description":"TEXT","category":"TEXT","line":"TEXT","station":"TEXT",
-                "reporter":"TEXT","month":"TEXT","week":"TEXT","customer":"TEXT","extra":"JSON"
-            }
-        }.items():
-            for col, decl in cols.items():
-                _ensure(c, tbl, col, decl)
+        c.execute(SCHEMA_MODELS)
+        c.execute(SCHEMA_FIRSTPIECE)
+        c.execute(SCHEMA_NONCONF)
         c.commit()
 
-init_db()
+@st.cache_data(show_spinner=False)
+def list_models_df() -> pd.DataFrame:
+    with get_conn() as c:
+        return pd.read_sql_query(
+            "SELECT model_no, COALESCE(name,'') AS name FROM models ORDER BY model_no",
+            c,
+        )
+
+def upsert_model(model_no: str, name: str = ""):
+    with get_conn() as c:
+        c.execute(
+            """INSERT INTO models(model_no, name)
+               VALUES(?, ?)
+               ON CONFLICT(model_no) DO UPDATE SET name=excluded.name""",
+            (model_no.strip(), name.strip()),
+        )
+        c.commit()
+
+# First piece CRUD
+def insert_firstpiece(payload: dict):
+    fields = [
+        "created_at","model_no","model_version","sn","mo",
+        "reporter","desc_text","top_path","bottom_path","extra"
+    ]
+    values = [payload.get(k) for k in fields]
+    with get_conn() as c:
+        c.execute(
+            f"INSERT INTO firstpiece({','.join(fields)}) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            values,
+        )
+        c.commit()
+
+def delete_firstpiece(fid: int):
+    with get_conn() as c:
+        c.execute("DELETE FROM firstpiece WHERE id=?", (fid,))
+        c.commit()
+
+@st.cache_data(show_spinner=False)
+def load_firstpiece_df(
+    model=None, version=None, sn=None, mo=None,
+    text=None, date_from=None, date_to=None
+) -> pd.DataFrame:
+    q = "SELECT * FROM firstpiece WHERE 1=1"
+    params: list = []
+    if model:
+        q += " AND model_no LIKE ?"; params += [f"%{model}%"]
+    if version:
+        q += " AND model_version LIKE ?"; params += [f"%{version}%"]
+    if sn:
+        q += " AND sn LIKE ?"; params += [f"%{sn}%"]
+    if mo:
+        q += " AND mo LIKE ?"; params += [f"%{mo}%"]
+    if text:
+        q += " AND (desc_text LIKE ? OR reporter LIKE ?)"; params += [f"%{text}%", f"%{text}%"]
+    if date_from:
+        q += " AND date(substr(created_at,1,10)) >= date(?)"; params += [str(date_from)]
+    if date_to:
+        q += " AND date(substr(created_at,1,10)) <= date(?)"; params += [str(date_to)]
+    q += " ORDER BY id DESC"
+    with get_conn() as c:
+        return pd.read_sql_query(q, c, params=params)
+
+# Nonconformities CRUD
+def insert_nonconf(payload: dict):
+    fields = [
+        "created_at","model_no","model_version","mo","sn","customer","line","workstation",
+        "unit_head","nc_type","description","root_cause","corrective_action",
+        "responsibility","defect_outflow","defect_item","defect_qty",
+        "inspection_qty","lot_qty","reporter","photo_path","extra"
+    ]
+    values = [payload.get(k) for k in fields]
+    with get_conn() as c:
+        c.execute(
+            f"INSERT INTO nonconf({','.join(fields)}) VALUES({','.join(['?']*len(fields))})",
+            values,
+        )
+        c.commit()
+
+def update_nonconf_photo(nid: int, rel_path: str):
+    with get_conn() as c:
+        c.execute("UPDATE nonconf SET photo_path=? WHERE id=?", (rel_path, nid))
+        c.commit()
+
+def delete_nonconf(nid: int):
+    with get_conn() as c:
+        c.execute("DELETE FROM nonconf WHERE id=?", (nid,))
+        c.commit()
+
+@st.cache_data(show_spinner=False)
+def load_nonconf_df(
+    model=None, version=None, sn=None, mo=None,
+    text=None, date_from=None, date_to=None
+) -> pd.DataFrame:
+    q = "SELECT * FROM nonconf WHERE 1=1"
+    params: list = []
+    if model:
+        q += " AND model_no LIKE ?"; params += [f"%{model}%"]
+    if version:
+        q += " AND model_version LIKE ?"; params += [f"%{version}%"]
+    if sn:
+        q += " AND sn LIKE ?"; params += [f"%{sn}%"]
+    if mo:
+        q += " AND mo LIKE ?"; params += [f"%{mo}%"]
+    if text:
+        q += " AND (description LIKE ? OR reporter LIKE ? OR nc_type LIKE ?)"
+        params += [f"%{text}%", f"%{text}%", f"%{text}%"]
+    if date_from:
+        q += " AND date(substr(created_at,1,10)) >= date(?)"; params += [str(date_from)]
+    if date_to:
+        q += " AND date(substr(created_at,1,10)) <= date(?)"; params += [str(date_to)]
+    q += " ORDER BY id DESC"
+    with get_conn() as c:
+        return pd.read_sql_query(q, c, params=params)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CSV header mapping for NC import
+# CSV/XLSX column mapping for Nonconformities
+# (add more aliases as needed; matching is case-insensitive substring)
 # ──────────────────────────────────────────────────────────────────────────────
-HEADER_MAP = {
-    "date": "created_at", "application date": "created_at", "發出日期": "created_at",
-    "created_at": "created_at",
-
-    "model": "model_no", "機種/料號": "model_no", "model/part no.": "model_no", "model no": "model_no",
-
-    "model version": "model_version", "version": "model_version",
-
-    "sn": "sn", "barcode": "sn",
-    "mo": "mo", "mo/po": "mo", "工作單/採購單號": "mo",
-
-    "nonconformity": "nc_type", "不符合分類": "nc_type", "defective item": "nc_type", "異常分類": "nc_type",
-
-    "description": "description", "不符合說明": "description",
-    "category": "category", "severity": "category",
-
-    "line": "line", "線別": "line",
-    "work station": "station", "作業站別": "station",
-
-    "reporter": "reporter", "提報人員": "reporter",
-    "customer": "customer", "客戶/供應商": "customer",
-    "month": "month", "月份": "month",
-    "week": "week", "週數": "week",
+ALIASES = {
+    "created_at": ["date", "日期"],
+    "nc_type": ["nonconformity", "不符合分類"],
+    "description": ["description of nonconformity", "不符合說明"],
+    "customer": ["customer", "supplier", "客戶", "供應商"],
+    "model_version": ["model/part no", "機種/料號"],
+    "mo": ["mo/po", "工單/採購單號"],
+    "defect_qty": ["defective qty", "不良數量"],
+    "inspection_qty": ["inspection qty", "檢驗數量"],
+    "lot_qty": ["lot qty", "工單數量"],
+    "line": ["line", "線別"],
+    "workstation": ["work station", "作業站別"],
+    "unit_head": ["unit head", "部門 負責人"],
+    "responsibility": ["責任者", "responsibility"],
+    "root_cause": ["root cause", "原因分析"],
+    "corrective_action": ["corrective action", "矯正預防措施及對策"],
+    "defect_outflow": ["defective outflow", "不良後流"],
+    "defect_item": ["defective item", "異常項目", "異常分類"],
 }
 
-def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    ren = {}
-    for col in df.columns:
-        key = str(col).strip().lower()
-        ren[col] = HEADER_MAP.get(key, key)
-    return df.rename(columns=ren)
+def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = {c: c for c in df.columns}
+    lower = [c.lower() for c in df.columns]
 
-def coerce_date(v):
-    if pd.isna(v):
-        return None
-    if isinstance(v, (datetime, date)):
-        return pd.to_datetime(v).date().isoformat()
-    try:
-        d = pd.to_datetime(v, errors="coerce")
-        if pd.isna(d):
-            return None
-        return d.date().isoformat()
-    except Exception:
-        return None
+    mapped = {}
+    for dest, aliases in ALIASES.items():
+        idx = None
+        for a in aliases:
+            a_low = a.lower()
+            for i, lc in enumerate(lower):
+                if a_low in lc:
+                    idx = i; break
+            if idx is not None:
+                break
+        if idx is not None:
+            mapped[dest] = df.columns[idx]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Inserts / loads
-# ──────────────────────────────────────────────────────────────────────────────
-def insert_first_piece(payload: dict):
-    fields = ["created_at","model_no","model_version","sn","mo","description","reporter","top_path","bottom_path"]
-    vals   = [payload.get(k) for k in fields]
-    with get_conn() as c:
-        c.execute(f"INSERT INTO {TABLE_FP}({','.join(fields)}) VALUES({','.join(['?']*len(fields))})", vals)
-        c.commit()
+    # Always present key columns even if missing
+    for must in [
+        "created_at","nc_type","description","customer","model_version","mo",
+        "defect_qty","inspection_qty","lot_qty","line","workstation","unit_head",
+        "responsibility","root_cause","corrective_action","defect_outflow","defect_item"
+    ]:
+        if must not in mapped:
+            df[must] = ""
 
-@st.cache_data(show_spinner=False)
-def load_firstpiece_df(model=None, version=None, sn=None, mo=None, text=None, dt_from=None, dt_to=None, limit=1000):
-    q = f"""SELECT id, created_at, model_no, model_version, sn, mo, description, reporter, top_path, bottom_path
-            FROM {TABLE_FP}
-            WHERE 1=1"""
-    params = []
-    if model:   q += " AND model_no LIKE ?";        params.append(f"%{model}%")
-    if version: q += " AND model_version LIKE ?";   params.append(f"%{version}%")
-    if sn:      q += " AND sn LIKE ?";              params.append(f"%{sn}%")
-    if mo:      q += " AND mo LIKE ?";              params.append(f"%{mo}%")
-    if text:    q += " AND (description LIKE ? OR reporter LIKE ?)"; params.extend([f"%{text}%", f"%{text}%"])
-    if dt_from: q += " AND created_at >= ?";        params.append(dt_from)
-    if dt_to:   q += " AND created_at <= ?";        params.append(dt_to)
-    q += " ORDER BY created_at DESC, id DESC LIMIT ?"; params.append(limit)
-    with get_conn() as c:
-        return pd.read_sql_query(q, c, params=params)
+    # Build normalized frame
+    out = pd.DataFrame()
+    for dest in [
+        "created_at","nc_type","description","customer","model_version","mo",
+        "defect_qty","inspection_qty","lot_qty","line","workstation","unit_head",
+        "responsibility","root_cause","corrective_action","defect_outflow","defect_item"
+    ]:
+        if dest in mapped:
+            out[dest] = df[mapped[dest]]
+        else:
+            out[dest] = df[dest]  # the blank we added
 
-def delete_first_piece(row_id: int):
-    with get_conn() as c:
-        c.execute(f"DELETE FROM {TABLE_FP} WHERE id=?", (row_id,))
-        c.commit()
-
-def insert_nc_rows(rows: list[dict]) -> int:
-    fields = ["created_at","model_no","model_version","sn","mo","nc_type","description","category",
-              "line","station","reporter","month","week","customer","extra"]
-    values = [[r.get(k) for k in fields] for r in rows]
-    with get_conn() as c:
-        c.executemany(f"INSERT INTO {TABLE_NC}({','.join(fields)}) VALUES({','.join(['?']*len(fields))})", values)
-        c.commit()
-    return len(values)
-
-@st.cache_data(show_spinner=False)
-def load_nc_df(model=None, version=None, sn=None, mo=None, text=None, dt_from=None, dt_to=None, limit=2000):
-    q = f"""SELECT id, created_at, model_no, model_version, sn, mo, nc_type, description, category,
-                   line, station, reporter, month, week, customer
-            FROM {TABLE_NC}
-            WHERE 1=1"""
-    params = []
-    if model:   q += " AND model_no LIKE ?";        params.append(f"%{model}%")
-    if version: q += " AND model_version LIKE ?";   params.append(f"%{version}%")
-    if sn:      q += " AND sn LIKE ?";              params.append(f"%{sn}%")
-    if mo:      q += " AND mo LIKE ?";              params.append(f"%{mo}%")
-    if text:    q += " AND (description LIKE ? OR nc_type LIKE ? OR reporter LIKE ? OR category LIKE ?)"
-    if text:        params.extend([f"%{text}%"]*4)
-    if dt_from: q += " AND created_at >= ?";        params.append(dt_from)
-    if dt_to:   q += " AND created_at <= ?";        params.append(dt_to)
-    q += " ORDER BY created_at DESC, id DESC LIMIT ?"; params.append(limit)
-    with get_conn() as c:
-        return pd.read_sql_query(q, c, params=params)
-
-def delete_nc_row(row_id: int):
-    with get_conn() as c:
-        c.execute(f"DELETE FROM {TABLE_NC} WHERE id=?", (row_id,))
-        c.commit()
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI
+# UI — App
 # ──────────────────────────────────────────────────────────────────────────────
+init_db()
 st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
+st.markdown(
+    """
+    <style>
+      /* make Search & filters slightly smaller, tidy cards */
+      section { font-size: 0.95rem; }
+      .small-input input {height:2rem; font-size:0.9rem;}
+      .small-select div[data-baseweb="select"] {font-size:0.9rem;}
+      .card {border:1px solid #e6e6e6; padding:1rem; border-radius:.6rem; margin-bottom:1rem;}
+      .muted {color:#666;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Quality Portal - Pilot")
 
-# ─ Sidebar: Create / Upload ─
+# ─────────── Sidebar: create/update & import ───────────
 with st.sidebar:
-    st.header("🧾 Create / Upload")
+    st.header("Create / Upload")
 
-    # First Piece form
-    with st.expander("📷 First Piece — New", expanded=False):
-        fp_date = st.date_input("Date", value=date.today(), format="YYYY-MM-DD")
+    # Add / Update Model
+    with st.expander("Add / Update Model", expanded=False):
+        ms, mn = st.text_input("Model (short form)", key="mdl"), st.text_input("Name / Customer (optional)", key="mname")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Save model", key="save_model_btn"):
+                if ms.strip():
+                    upsert_model(ms, mn)
+                    list_models_df.clear()
+                    st.success("Model saved.")
+                else:
+                    st.error("Model cannot be empty.")
+        with c2:
+            if st.button("Delete model", key="del_model_btn"):
+                if ms.strip():
+                    with get_conn() as c:
+                        c.execute("DELETE FROM models WHERE model_no=?", (ms.strip(),))
+                        c.commit()
+                    list_models_df.clear()
+                    st.warning("Model deleted (if existed).")
+                else:
+                    st.error("Enter a model first.")
+
+    # First Piece (TOP/BOTTOM)
+    with st.expander("New First Piece", expanded=False):
         fp_model = st.text_input("Model", key="fp_model")
-        fp_ver   = st.text_input("Version", key="fp_ver")
-        fp_sn    = st.text_input("SN", key="fp_sn")
+        fp_ver   = st.text_input("Model Version (full)", key="fp_ver")
+        fp_sn    = st.text_input("SN / Barcode", key="fp_sn")
         fp_mo    = st.text_input("MO / Work Order", key="fp_mo")
-        fp_desc  = st.text_area("Notes / Description", key="fp_desc")
-        col_up1, col_up2 = st.columns(2)
-        with col_up1:
-            up_top = st.file_uploader("TOP photo", type=["jpg","jpeg","png"], key="fp_top")
-        with col_up2:
-            up_bot = st.file_uploader("BOTTOM photo", type=["jpg","jpeg","png"], key="fp_bottom")
-        if st.button("Save First Piece", type="primary", key="save_fp"):
+        fp_desc  = st.text_area("Notes (optional)", key="fp_desc")
+
+        tcol, bcol = st.columns(2)
+        with tcol:
+            up_top = st.file_uploader("Upload TOP photo", type=["jpg","jpeg","png"], key="fp_top")
+        with bcol:
+            up_bottom = st.file_uploader("Upload BOTTOM photo", type=["jpg","jpeg","png"], key="fp_bottom")
+
+        if st.button("Save first piece", key="fp_save_btn"):
             if not fp_model.strip():
                 st.error("Model is required.")
-            elif not (up_top or up_bot):
-                st.error("Please upload at least one photo (TOP or BOTTOM).")
             else:
-                top_rel = save_image(up_top, "firstpiece/top") if up_top else None
-                bot_rel = save_image(up_bot, "firstpiece/bottom") if up_bot else None
-                insert_first_piece({
-                    "created_at": fp_date.isoformat(),
-                    "model_no": fp_model.strip(),
-                    "model_version": fp_ver.strip(),
-                    "sn": fp_sn.strip(),
-                    "mo": fp_mo.strip(),
-                    "description": fp_desc.strip(),
-                    "reporter": cur_user(),
-                    "top_path": top_rel,
-                    "bottom_path": bot_rel,
-                })
+                rel_top = _save_image("firstpiece", fp_model, up_top) if up_top else None
+                rel_bot = _save_image("firstpiece", fp_model, up_bottom) if up_bottom else None
+                payload = dict(
+                    created_at=now_iso(),
+                    model_no=fp_model.strip(),
+                    model_version=fp_ver.strip(),
+                    sn=fp_sn.strip(),
+                    mo=fp_mo.strip(),
+                    reporter=cur_user(),
+                    desc_text=fp_desc.strip(),
+                    top_path=rel_top,
+                    bottom_path=rel_bot,
+                    extra=json.dumps({}, ensure_ascii=False),
+                )
+                insert_firstpiece(payload)
                 load_firstpiece_df.clear()
-                st.success("First Piece saved.")
+                st.success("First piece saved.")
 
-    # Non-Conformity manual form
-    with st.expander("📝 Non-Conformity — New", expanded=False):
-        nc_date = st.date_input("Date", value=date.today(), format="YYYY-MM-DD", key="nc_date")
-        nc_model = st.text_input("Model", key="nc_model")
-        nc_ver   = st.text_input("Version", key="nc_ver")
-        nc_sn    = st.text_input("SN", key="nc_sn")
-        nc_mo    = st.text_input("MO", key="nc_mo")
-        nc_type  = st.text_input("Nonconformity Type", key="nc_type")
-        nc_desc  = st.text_area("Description", key="nc_desc")
-        nc_cat   = st.selectbox("Category", ["", "Minor", "Major", "Critical"], key="nc_cat")
-        nc_line  = st.text_input("Line", key="nc_line")
-        nc_sta   = st.text_input("Station", key="nc_sta")
+    # New Non-Conformity (manual)
+    with st.expander("New Non-Conformity", expanded=False):
+        nc_model = st.text_input("Model (short, optional)", key="nc_model")
+        nc_ver   = st.text_input("Model Version (full)", key="nc_ver")
+        nc_sn    = st.text_input("SN / Barcode", key="nc_sn")
+        nc_mo    = st.text_input("MO / Work Order", key="nc_mo")
         nc_cust  = st.text_input("Customer/Supplier", key="nc_cust")
-        nc_week  = st.text_input("Week", key="nc_week")
-        nc_month = st.text_input("Month", key="nc_month")
-        if st.button("Save Non-Conformity", type="primary", key="nc_save"):
-            if not nc_model.strip():
-                st.error("Model is required.")
-            else:
-                row = {
-                    "created_at": nc_date.isoformat(),
-                    "model_no": nc_model.strip(),
-                    "model_version": nc_ver.strip(),
-                    "sn": nc_sn.strip(),
-                    "mo": nc_mo.strip(),
-                    "nc_type": nc_type.strip(),
-                    "description": nc_desc.strip(),
-                    "category": nc_cat.strip(),
-                    "line": nc_line.strip(),
-                    "station": nc_sta.strip(),
-                    "reporter": cur_user(),
-                    "month": nc_month.strip(),
-                    "week": nc_week.strip(),
-                    "customer": nc_cust.strip(),
-                    "extra": None,
-                }
-                insert_nc_rows([row])
-                load_nc_df.clear()
-                st.success("Non-Conformity saved.")
+        nc_line  = st.text_input("Line", key="nc_line")
+        nc_ws    = st.text_input("Work Station", key="nc_ws")
+        nc_unit  = st.text_input("Unit Head", key="nc_unit")
+        nc_type  = st.text_input("Nonconformity Type", key="nc_type")
+        nc_desc  = st.text_area("Description of Nonconformity", key="nc_desc")
+        nc_root  = st.text_area("Root Cause", key="nc_root")
+        nc_ca    = st.text_area("Corrective Action", key="nc_ca")
+        nc_resp  = st.text_input("Responsibility", key="nc_resp")
+        nc_out   = st.text_input("Defective Outflow", key="nc_out")
+        nc_item  = st.text_input("Defective Item", key="nc_item")
+        n_dq, n_iq, n_lq = st.text_input("Defective Qty", key="n_dq"), st.text_input("Inspection Qty", key="n_iq"), st.text_input("Lot Qty", key="n_lq")
+        up_nc_photo = st.file_uploader("Photo (optional)", type=["jpg","jpeg","png"], key="nc_photo")
 
-    # NC CSV import
-    with st.expander("📤 Import Non-Conformities (CSV)", expanded=False):
-        up = st.file_uploader("CSV file", type=["csv"], key="nc_csv")
-        if up:
+        if st.button("Save non-conformity", key="nc_save_btn"):
+            rel = _save_image("nonconf", nc_model or "unknown", up_nc_photo) if up_nc_photo else None
+            payload = dict(
+                created_at=now_iso(),
+                model_no=nc_model.strip(),
+                model_version=nc_ver.strip(),
+                mo=nc_mo.strip(),
+                sn=nc_sn.strip(),
+                customer=nc_cust.strip(),
+                line=nc_line.strip(),
+                workstation=nc_ws.strip(),
+                unit_head=nc_unit.strip(),
+                nc_type=nc_type.strip(),
+                description=nc_desc.strip(),
+                root_cause=nc_root.strip(),
+                corrective_action=nc_ca.strip(),
+                responsibility=nc_resp.strip(),
+                defect_outflow=nc_out.strip(),
+                defect_item=nc_item.strip(),
+                defect_qty=n_dq.strip(),
+                inspection_qty=n_iq.strip(),
+                lot_qty=n_lq.strip(),
+                reporter=cur_user(),
+                photo_path=rel,
+                extra=json.dumps({}, ensure_ascii=False),
+            )
+            insert_nonconf(payload)
+            load_nonconf_df.clear()
+            st.success("Non-conformity saved.")
+
+    # Import (CSV/XLSX → Non-Conformities)
+    with st.expander("Import Non-Conformities (CSV/XLSX)", expanded=False):
+        f = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx","xls"], key="imp_file")
+        imp_model_hint = st.text_input("Default model short code (optional)", key="imp_model")
+        if f is not None:
             try:
-                raw = up.read()
-                df = pd.read_csv(io.BytesIO(raw), encoding="utf-8", keep_default_na=False)
-            except UnicodeDecodeError:
-                up.seek(0)
-                df = pd.read_csv(up, encoding="latin-1", keep_default_na=False)
-            ndf = normalize_headers(df)
-            rows = []
-            for _, r in ndf.iterrows():
-                known = {
-                    "created_at": coerce_date(r.get("created_at")) or today_iso(),
-                    "model_no": str(r.get("model_no") or "").strip(),
-                    "model_version": str(r.get("model_version") or "").strip(),
-                    "sn": str(r.get("sn") or "").strip(),
-                    "mo": str(r.get("mo") or "").strip(),
-                    "nc_type": str(r.get("nc_type") or "").strip(),
-                    "description": str(r.get("description") or "").strip(),
-                    "category": str(r.get("category") or "").strip(),
-                    "line": str(r.get("line") or "").strip(),
-                    "station": str(r.get("station") or "").strip(),
-                    "reporter": str(r.get("reporter") or cur_user()).strip() or cur_user(),
-                    "month": str(r.get("month") or "").strip(),
-                    "week": str(r.get("week") or "").strip(),
-                    "customer": str(r.get("customer") or "").strip(),
-                }
-                extras = {k: r[k] for k in ndf.columns if k not in known}
-                known["extra"] = json.dumps(extras, ensure_ascii=False) if extras else None
-                rows.append(known)
-            if rows:
-                inserted = insert_nc_rows(rows)
-                load_nc_df.clear()
-                st.success(f"Imported {inserted} record(s).")
+                if f.name.lower().endswith((".xlsx",".xls")):
+                    df_raw = pd.read_excel(f)
+                else:
+                    # auto encoding
+                    df_raw = pd.read_csv(f, encoding="utf-8-sig")
+            except Exception:
+                f.seek(0)
+                df_raw = pd.read_csv(f, encoding="latin1")
 
-# ─ Search & View (Tabs) ─
+            df = _map_columns(df_raw.copy())
+            st.caption("Column mapping preview (first 5 rows):")
+            st.dataframe(df.head(), use_container_width=True, hide_index=True)
+
+            if st.button("Import now", key="import_nc_btn"):
+                count = 0
+                for _, row in df.iterrows():
+                    # Parse created_at if possible
+                    c_at = str(row.get("created_at","")).strip()
+                    if not c_at:
+                        created_at = now_iso()
+                    else:
+                        try:
+                            # accept yyyy-mm-dd or excel dates
+                            created_at = pd.to_datetime(c_at).isoformat(timespec="seconds")
+                        except Exception:
+                            created_at = now_iso()
+
+                    payload = dict(
+                        created_at=created_at,
+                        model_no=(imp_model_hint or "").strip(),
+                        model_version=str(row.get("model_version","") or ""),
+                        mo=str(row.get("mo","") or ""),
+                        sn="",  # often absent in nonconf sheet
+                        customer=str(row.get("customer","") or ""),
+                        line=str(row.get("line","") or ""),
+                        workstation=str(row.get("workstation","") or ""),
+                        unit_head=str(row.get("unit_head","") or ""),
+                        nc_type=str(row.get("nc_type","") or ""),
+                        description=str(row.get("description","") or ""),
+                        root_cause=str(row.get("root_cause","") or ""),
+                        corrective_action=str(row.get("corrective_action","") or ""),
+                        responsibility=str(row.get("responsibility","") or ""),
+                        defect_outflow=str(row.get("defect_outflow","") or ""),
+                        defect_item=str(row.get("defect_item","") or ""),
+                        defect_qty=str(row.get("defect_qty","") or ""),
+                        inspection_qty=str(row.get("inspection_qty","") or ""),
+                        lot_qty=str(row.get("lot_qty","") or ""),
+                        reporter=cur_user(),
+                        photo_path=None,
+                        extra=json.dumps({}, ensure_ascii=False),
+                    )
+                    insert_nonconf(payload)
+                    count += 1
+
+                load_nonconf_df.clear()
+                st.success(f"Imported {count} records.")
+
+# ─────────── Search & View (center) ───────────
 st.subheader("🔎 Search & View")
-tab_nc, tab_fp = st.tabs(["Non-Conformities", "First Piece"])
 
-# Common filter controls helper
-def filter_controls(prefix: str):
-    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,2])
-    model = c1.text_input("Model contains", key=f"{prefix}_m")
-    ver   = c2.text_input("Version contains", key=f"{prefix}_v")
-    sn    = c3.text_input("SN contains", key=f"{prefix}_s")
-    mo    = c4.text_input("MO contains", key=f"{prefix}_o")
-    text  = c5.text_input("Text (desc/type/reporter/category)", key=f"{prefix}_t")
-    d1, d2, d3 = st.columns([1,1,1])
-    dt_from = d1.date_input("From date", value=None, format="YYYY-MM-DD", key=f"{prefix}_from")
-    dt_to   = d2.date_input("To date", value=None, format="YYYY-MM-DD", key=f"{prefix}_to")
-    limit   = d3.number_input("Max rows", 50, 10000, 1000, 50, key=f"{prefix}_lim")
-    return model, ver, sn, mo, text, (dt_from.isoformat() if dt_from else None), (dt_to.isoformat() if dt_to else None), int(limit)
+with st.expander("Filters", expanded=True):
+    c1,c2,c3,c4,c5 = st.columns([1,1,1,1,2])
+    f_model   = c1.text_input("Model contains", key="f_model", placeholder="e.g. 190-")
+    f_ver     = c2.text_input("Version contains", key="f_ver")
+    f_sn      = c3.text_input("SN contains", key="f_sn")
+    f_mo      = c4.text_input("MO contains", key="f_mo")
+    f_text    = c5.text_input("Text in description/reporter/type", key="f_text")
 
-with tab_nc:
-    st.caption("Search Non-Conformities")
-    m,v,s,o,t,dfrom,dto,lim = filter_controls("nc")
-    ndf = load_nc_df(m, v, s, o, t, dfrom, dto, lim)
-    st.markdown(f"**{len(ndf)} record(s)**")
-    if ndf.empty:
-        st.info("No matching records.")
-    else:
-        for _, r in ndf.iterrows():
-            with st.container(border=True):
-                cols = st.columns([4,1])
-                with cols[0]:
-                    st.markdown(
-                        f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} "
-                        f"| **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
-                    )
-                    st.caption(
-                        f"🗓 {r['created_at'] or '-'}  |  👤 {r['reporter'] or '-'}  |  "
-                        f"🏷 {r['nc_type'] or '-'}  |  📦 {r['category'] or '-'}"
-                    )
-                    if r.get("description"):
-                        st.write(r["description"])
-                    meta=[]
-                    for k,label in (("line","Line"),("station","Station"),("customer","Customer"),("week","Week"),("month","Month")):
-                        if r.get(k): meta.append(f"{label}: {r[k]}")
-                    if meta: st.caption(" · ".join(meta))
-                with cols[1]:
-                    if st.button("Delete", key=f"del_nc_{r['id']}"):
-                        delete_nc_row(int(r["id"]))
-                        load_nc_df.clear()
-                        st.rerun()
-        with st.expander("Table + Export"):
-            st.dataframe(ndf, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download filtered CSV",
-                data=ndf.to_csv(index=False).encode("utf-8"),
-                file_name=f"nonconformities_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.csv",
-                mime="text/csv"
+    d1, d2 = st.columns(2)
+    f_from  = d1.date_input("From (date)", value=None, key="f_from")
+    f_to    = d2.date_input("To (date)", value=None, key="f_to")
+
+# FIRST PIECE results
+with st.expander("📁 First Piece (results)", expanded=True):
+    fdf = load_firstpiece_df(
+        model=f_model or None, version=f_ver or None, sn=f_sn or None, mo=f_mo or None,
+        text=f_text or None, date_from=f_from or None, date_to=f_to or None
+    )
+    st.caption(f"{len(fdf)} record(s)")
+    for _, r in fdf.iterrows():
+        with st.container():
+            st.markdown(
+                f"**Model:** {r['model_no'] or '-'}  |  **Version:** {r['model_version'] or '-'}"
+                f"  |  **SN:** {r['sn'] or '-'}  |  **MO:** {r['mo'] or '-'}"
             )
+            meta = f"📅 {r['created_at']} &nbsp;&nbsp; 👤 Reporter: {r['reporter'] or '-'}"
+            st.markdown(f"<span class='muted'>{meta}</span>", unsafe_allow_html=True)
 
-with tab_fp:
-    st.caption("Search First Piece")
-    m,v,s,o,t,dfrom,dto,lim = filter_controls("fp")
-    fdf = load_firstpiece_df(m, v, s, o, t, dfrom, dto, lim)
-    st.markdown(f"**{len(fdf)} record(s)**")
-    if fdf.empty:
-        st.info("No matching records.")
-    else:
-        for _, r in fdf.iterrows():
-            with st.container(border=True):
-                top = st.columns([1,1,2])
-                # left: TOP
-                with top[0]:
-                    if r.get("top_path"):
-                        p = DATA_DIR / str(r["top_path"])
-                        if p.exists():
-                            st.image(str(p), caption="TOP", use_container_width=True)
-                # middle: BOTTOM
-                with top[1]:
-                    if r.get("bottom_path"):
-                        p = DATA_DIR / str(r["bottom_path"])
-                        if p.exists():
-                            st.image(str(p), caption="BOTTOM", use_container_width=True)
-                # right: meta
-                with top[2]:
-                    st.markdown(
-                        f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} "
-                        f"| **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
-                    )
-                    st.caption(f"🗓 {r['created_at'] or '-'}  |  👤 Reporter: {r['reporter'] or '-'}")
-                    if r.get("description"):
-                        st.write(r["description"])
-                    if st.button("Delete", key=f"del_fp_{r['id']}"):
-                        delete_first_piece(int(r["id"]))
-                        load_firstpiece_df.clear()
-                        st.rerun()
+            cc = st.columns(2)
+            p_top = _path_if_exists(r.get("top_path"))
+            p_bot = _path_if_exists(r.get("bottom_path"))
+            with cc[0]:
+                if p_top:
+                    st.image(str(p_top), use_container_width=True, caption="TOP")
+            with cc[1]:
+                if p_bot:
+                    st.image(str(p_bot), use_container_width=True, caption="BOTTOM")
 
-        with st.expander("Table + Export"):
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download filtered CSV",
-                data=fdf.to_csv(index=False).encode("utf-8"),
-                file_name=f"firstpiece_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.csv",
-                mime="text/csv"
+            if r.get("desc_text"):
+                st.write(r["desc_text"])
+
+            if st.button("Delete", key=f"del_fp_{r['id']}"):
+                delete_firstpiece(int(r["id"]))
+                load_firstpiece_df.clear()
+                st.experimental_rerun()
+
+# NON-CONFORMITIES results
+with st.expander("📁 Non-Conformities (results)", expanded=True):
+    ndf = load_nonconf_df(
+        model=f_model or None, version=f_ver or None, sn=f_sn or None, mo=f_mo or None,
+        text=f_text or None, date_from=f_from or None, date_to=f_to or None
+    )
+    st.caption(f"{len(ndf)} record(s)")
+
+    # Cards
+    for _, r in ndf.iterrows():
+        with st.container():
+            st.markdown(
+                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'}"
+                f" | **SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
             )
+            meta = (
+                f"📅 {r['created_at'] or '-'} &nbsp;&nbsp; 👤 {r['reporter'] or '-'} "
+                f"&nbsp;&nbsp; 📦 {r['defect_item'] or '-'}"
+            )
+            st.markdown(f"<span class='muted'>{meta}</span>", unsafe_allow_html=True)
 
-st.caption(f"Data: `{DATA_DIR}` · DB: `{DB_PATH.name}` · User: {cur_user()}`")
+            cimg, ctxt = st.columns([1,2])
+            with cimg:
+                pp = _path_if_exists(r.get("photo_path"))
+                if pp:
+                    st.image(str(pp), use_container_width=True)
+                else:
+                    up = st.file_uploader(" + Photo", type=["jpg","jpeg","png"], key=f"addph_{r['id']}")
+                    if up is not None:
+                        rel = _save_image("nonconf", r.get("model_no") or "unknown", up)
+                        update_nonconf_photo(int(r["id"]), rel)
+                        load_nonconf_df.clear()
+                        st.experimental_rerun()
+
+            with ctxt:
+                # show all important fields (and anything else in extra JSON)
+                lines = [
+                    ("Type", r.get("nc_type")),
+                    ("Customer", r.get("customer")),
+                    ("Line", r.get("line")),
+                    ("Work Station", r.get("workstation")),
+                    ("Unit Head", r.get("unit_head")),
+                    ("Responsibility", r.get("responsibility")),
+                    ("Root Cause", r.get("root_cause")),
+                    ("Corrective Action", r.get("corrective_action")),
+                    ("Defective Outflow", r.get("defect_outflow")),
+                    ("Defective Item", r.get("defect_item")),
+                    ("Defective Qty", r.get("defect_qty")),
+                    ("Inspection Qty", r.get("inspection_qty")),
+                    ("Lot Qty", r.get("lot_qty")),
+                ]
+                if r.get("description"):
+                    st.write(r["description"])
+                for label, val in lines:
+                    if val:
+                        st.caption(f"**{label}:** {val}")
+
+            cact1, cact2 = st.columns([1,8])
+            with cact1:
+                if st.button("Delete", key=f"del_nc_{r['id']}"):
+                    delete_nonconf(int(r["id"]))
+                    load_nonconf_df.clear()
+                    st.experimental_rerun()
+
+    # Table + Export
+    with st.expander("Table view & export"):
+        st.dataframe(ndf, use_container_width=True, hide_index=True)
+        csv = ndf.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Download CSV", data=csv, file_name="nonconformities_export.csv", mime="text/csv")
