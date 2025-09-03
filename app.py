@@ -450,7 +450,8 @@ with st.expander("🗂️ Non-Conformities (results)", expanded=not nc_df.empty)
                 with cols[0]:
                     p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                     if p and p.exists():
-                        st.image(str(p), use_container_width=True)
+                        - st.image(str(p), use_container_width=True)
+                        + st.image(str(p), use_column_width=True)
                 with cols[1]:
                     st.markdown(
                         f"**{r.get('nc_type','-')}**  |  Severity: **{r.get('severity','-')}**  "
@@ -499,7 +500,8 @@ with st.expander("🗂️ First Piece (results)", expanded=not fp_df.empty):
                 with cols[0]:
                     p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                     if p and p.exists():
-                        st.image(str(p), use_container_width=True)
+                        - st.image(str(p), use_container_width=True)
+                        + st.image(str(p), use_column_width=True)
                 with cols[1]:
                     st.markdown(
                         f"**Version:** {r.get('model_version','-')}  |  **SN:** {r.get('sn','-')}  |  **MO:** {r.get('mo','-')}"
