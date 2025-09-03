@@ -134,8 +134,8 @@ def load_firstpiece_df(
     d_from=None, d_to=None, limit=500
 ) -> pd.DataFrame:
     q = """
-    SELECT id, created_at, model_no, model_version, sn, mo, reporter,
-           description, image_path, extra
+    SELECT id, created_at, model_no, model_version, sn, mo,
+           reporter, description, image_top_path, image_bottom_path
     FROM first_piece
     WHERE 1=1
     """
