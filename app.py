@@ -142,7 +142,7 @@ with st.sidebar:
         m_name = st.text_input("Name / Customer (optional)", key="mname")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Save model", use_column_width=True):
+            if st.button("Save model"):
                 if m_no.strip():
                     upsert_model(m_no, m_name)
                     st.success("Saved.")
@@ -150,7 +150,7 @@ with st.sidebar:
                 else:
                     st.error("Model cannot be empty.")
         with col_b:
-            if st.button("Delete model", use_column_width=True, type="secondary"):
+            if st.button("Delete model", type="secondary"):
                 if m_no.strip():
                     delete_model(m_no.strip())
                     st.warning("Deleted (if it existed).")
