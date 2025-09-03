@@ -142,7 +142,7 @@ with st.sidebar:
         m_name = st.text_input("Name / Customer (optional)", key="mname")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Save model", use_container_width=True):
+            if st.button("Save model", use_column_width=True):
                 if m_no.strip():
                     upsert_model(m_no, m_name)
                     st.success("Saved.")
@@ -150,7 +150,7 @@ with st.sidebar:
                 else:
                     st.error("Model cannot be empty.")
         with col_b:
-            if st.button("Delete model", use_container_width=True, type="secondary"):
+            if st.button("Delete model", use_column_width=True, type="secondary"):
                 if m_no.strip():
                     delete_model(m_no.strip())
                     st.warning("Deleted (if it existed).")
@@ -229,7 +229,7 @@ if picked:
                 with cols[0]:
                     p = DATA_DIR / str(r["image_path"]) if r["image_path"] else None
                     if p and p.exists():
-                        st.image(str(p), use_container_width=True)
+                        st.image(str(p), use_column_width=True)
                 with cols[1]:
                     st.markdown(f"**Version:** {r['model_version'] or '-'}  |  **SN:** {r['sn'] or '-'}  |  **MO:** {r['mo'] or '-'}")
                     st.caption(f"{r['created_at']}  ·  Reporter: {r['reporter']}")
@@ -237,6 +237,6 @@ if picked:
                         st.write(r["description"])
         # table view under cards
         with st.expander("Show table"):
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
+            st.dataframe(fdf, use_column_width=True, hide_index=True)
 else:
     st.info("Select a model in the sidebar to view its history.")
