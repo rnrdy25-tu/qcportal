@@ -56,7 +56,31 @@ def safe_show_image(path: Path, caption: str | None = None):
                 st.caption(f"🖼️ {caption}: (no preview)")
     except Exception as e:
         st.caption(f"⚠️ Unable to preview image ({e}).")
+        
+# ---- SAFE UI HELPERS -------------------------------------------------
 
+def safe_dataframe(df):
+    """Render a DataFrame without crashing if some args are unsupported."""
+    try:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    except TypeError:
+        # older/newer Streamlit that doesn't support hide_index
+        st.dataframe(df, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not render table: {e}")
+
+def download_csv_button(df, label, filename):
+    """Offer a CSV download and make sure we always pass bytes."""
+    try:
+        data_bytes = df.to_csv(index=False).encode("utf-8")
+    except Exception as e:
+        st.warning(f"Export failed: {e}")
+        return
+    try:
+        st.download_button(label, data=data_bytes, file_name=filename, mime="text/csv")
+    except Exception as e:
+        st.warning(f"Download button failed: {e}")
+        
 # --------------------------- Database ---------------------------
 
 SCHEMA = {
@@ -495,8 +519,8 @@ if run_first:
                         st.warning("Deleted. Click search again.")
 
         st.markdown("#### Table view & export")
-        st.dataframe(df_fp, use_container_width=True, hide_index=True)
-        st.download_button("Download CSV", df_fp.to_csv(index=False).encode("utf-8"), "first_piece.csv", "text/csv")
+        safe_dataframe(df_fp)
+        download_csv_button(df_fp, "Download CSV", "first_piece.csv")
 
 # ------------------ Non-Conformities results ------------------
 if run_nc:
@@ -538,5 +562,6 @@ if run_nc:
                         st.warning("Deleted. Click search again.")
 
         st.markdown("#### Table view & export")
-        st.dataframe(df_nc, use_container_width=True, hide_index=True)
-        st.download_button("Download CSV", df_nc.to_csv(index=False).encode("utf-8"), "nonconfs.csv", "text/csv")
+        safe_dataframe(df_nc)
+        download_csv_button(df_nc, "Download CSV", "nonconfs.csv")
+
