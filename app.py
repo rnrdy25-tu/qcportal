@@ -1,82 +1,53 @@
 # Quality Portal - Pilot
-# End-to-end Streamlit app with Models, First Piece, Non-Conformities,
-# Search & View, CSV import, and Export (robust against nested-block errors)
+# First Piece + Non-Conformities (create, import, search, view)
+# Images are stored under DATA_DIR/images/<model> and file paths are saved in DB
 
-from __future__ import annotations
-
-import os
-import io
-import json
-import sqlite3
+import os, io, json, sqlite3
 from pathlib import Path
 from datetime import datetime, date
-from typing import Iterable, Dict, Any, Tuple, List
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
 
-# =============================================================================
-# ------------------------------ SETTINGS -------------------------------------
-# =============================================================================
-APP_NAME = "Quality Portal - Pilot"
-DEFAULT_REPORTER = "Admin1"   # Your default login name (can wire SSO later)
+# ============ Cloud-safe storage ============
 
-# Prefer a writable folder on Streamlit Cloud; fall back locally
-def pick_data_dir() -> Path:
+def _pick_data_dir() -> Path:
     for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
         try:
             base.mkdir(parents=True, exist_ok=True)
-            (base / ".w").write_text("ok", encoding="utf-8")
+            (base / ".write_check").write_text("ok", encoding="utf-8")
             return base
         except Exception:
-            continue
-    raise RuntimeError("No writable directory available")
+            pass
+    raise RuntimeError("No writable directory found")
 
-DATA_DIR = pick_data_dir()
-IMG_DIR = DATA_DIR / "images"
-DB_PATH = DATA_DIR / "qc_portal.sqlite3"
+DATA_DIR = _pick_data_dir()
+IMG_DIR  = DATA_DIR / "images"
+DB_PATH  = DATA_DIR / "qc_portal.sqlite3"
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
-# ------------------------------- UTILITIES -----------------------------------
-# =============================================================================
+# ============ helpers ============
+
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
-def safe_user() -> str:
-    # Best effort. Use DEFAULT_REPORTER if available.
-    return os.environ.get("USERNAME") or os.environ.get("USER") or DEFAULT_REPORTER
+def current_user() -> str:
+    # set admin name here (default: Admin1 if none)
+    return os.environ.get("QC_USER", "Admin1")
 
-def save_image(rel_subdir: str, uploaded_file) -> str:
-    """
-    Save uploaded image under images/<rel_subdir>/... -> return path relative to DATA_DIR.
-    """
-    sub = IMG_DIR / rel_subdir
-    sub.mkdir(parents=True, exist_ok=True)
+def save_image(model_no: str, uploaded_file) -> str:
+    """Save uploaded image; return relative path from DATA_DIR."""
+    folder = IMG_DIR / (model_no or "_misc")
+    folder.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    fname = f"{ts}_{uploaded_file.name.replace(' ', '_')}"
-    out_path = sub / fname
-    img = Image.open(uploaded_file).convert("RGB")
-    img.save(out_path, format="JPEG", quality=90)
-    return str(out_path.relative_to(DATA_DIR))
+    fn = f"{ts}_{uploaded_file.name.replace(' ', '_')}"
+    out = folder / fn
+    Image.open(uploaded_file).convert("RGB").save(out, format="JPEG", quality=90)
+    return str(out.relative_to(DATA_DIR))
 
-def try_parse_date(s: str | None) -> date | None:
-    if not s or pd.isna(s):
-        return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(str(s), fmt).date()
-        except Exception:
-            continue
-    try:
-        return pd.to_datetime(s).date()
-    except Exception:
-        return None
+# ============ database ============
 
-# =============================================================================
-# ------------------------------- DATABASE ------------------------------------
-# =============================================================================
 SCHEMA_MODELS = """
 CREATE TABLE IF NOT EXISTS models(
   model_no TEXT PRIMARY KEY,
@@ -84,7 +55,25 @@ CREATE TABLE IF NOT EXISTS models(
 );
 """
 
-SCHEMA_FIRSTPIECE = """
+# We keep “wide” fields in extra JSON so we can ingest more columns without altering tables.
+SCHEMA_NONCONF = """
+CREATE TABLE IF NOT EXISTS nonconformities(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT,
+  model_no TEXT,
+  model_version TEXT,
+  sn TEXT,
+  mo TEXT,
+  reporter TEXT,
+  severity TEXT,
+  description TEXT,
+  top_image_path TEXT,
+  bottom_image_path TEXT,
+  extra JSON
+);
+"""
+
+SCHEMA_FIRST = """
 CREATE TABLE IF NOT EXISTS first_piece(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at TEXT,
@@ -93,28 +82,10 @@ CREATE TABLE IF NOT EXISTS first_piece(
   sn TEXT,
   mo TEXT,
   reporter TEXT,
-  description TEXT,
-  top_image TEXT,
-  bottom_image TEXT,
+  notes TEXT,
+  top_image_path TEXT,
+  bottom_image_path TEXT,
   extra JSON
-);
-"""
-
-SCHEMA_NONCONF = """
-CREATE TABLE IF NOT EXISTS nonconformities(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT,           -- occurrence date
-  model_no TEXT,
-  model_version TEXT,
-  sn TEXT,
-  mo TEXT,
-  reporter TEXT,
-  nonconformity TEXT,        -- title / category
-  description TEXT,          -- details
-  type TEXT,                 -- Minor/Major/Critical etc.
-  image_path TEXT,           -- optional representative
-  images JSON,               -- list of extra photos
-  raw JSON                   -- full row JSON for anything else
 );
 """
 
@@ -124,511 +95,420 @@ def get_conn():
 def init_db():
     with get_conn() as c:
         c.execute(SCHEMA_MODELS)
-        c.execute(SCHEMA_FIRSTPIECE)
         c.execute(SCHEMA_NONCONF)
+        c.execute(SCHEMA_FIRST)
         c.commit()
 
-init_db()
-
-# =============================================================================
-# ----------------------------- CACHED QUERIES --------------------------------
-# =============================================================================
 @st.cache_data(show_spinner=False)
-def list_models_df() -> pd.DataFrame:
+def list_models():
     with get_conn() as c:
         return pd.read_sql_query(
             "SELECT model_no, COALESCE(name,'') AS name FROM models ORDER BY model_no", c
         )
 
-@st.cache_data(show_spinner=False)
-def query_firstpiece(
-    model_kw: str = "",
-    version_kw: str = "",
-    sn_kw: str = "",
-    mo_kw: str = "",
-    text_kw: str = "",
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> pd.DataFrame:
-    q = """SELECT * FROM first_piece WHERE 1=1"""
-    params: List[Any] = []
-
-    def like_col(col: str, kw: str):
-        nonlocal q, params
-        if kw.strip():
-            q += f" AND {col} LIKE ?"
-            params.append(f"%{kw.strip()}%")
-
-    like_col("model_no", model_kw)
-    like_col("model_version", version_kw)
-    like_col("sn", sn_kw)
-    like_col("mo", mo_kw)
-    if text_kw.strip():
-        q += " AND (description LIKE ? OR reporter LIKE ?)"
-        params.extend([f"%{text_kw.strip()}%", f"%{text_kw.strip()}%"])
-
-    if date_from:
-        q += " AND date(substr(created_at,1,10)) >= date(?)"
-        params.append(date_from.isoformat())
-    if date_to:
-        q += " AND date(substr(created_at,1,10)) <= date(?)"
-        params.append(date_to.isoformat())
-
-    q += " ORDER BY id DESC"
-    with get_conn() as c:
-        return pd.read_sql_query(q, c, params=params)
-
-@st.cache_data(show_spinner=False)
-def query_nonconf(
-    model_kw: str = "",
-    version_kw: str = "",
-    sn_kw: str = "",
-    mo_kw: str = "",
-    text_kw: str = "",
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> pd.DataFrame:
-    q = """SELECT * FROM nonconformities WHERE 1=1"""
-    params: List[Any] = []
-
-    def like_col(col: str, kw: str):
-        nonlocal q, params
-        if kw.strip():
-            q += f" AND {col} LIKE ?"
-            params.append(f"%{kw.strip()}%")
-
-    like_col("model_no", model_kw)
-    like_col("model_version", version_kw)
-    like_col("sn", sn_kw)
-    like_col("mo", mo_kw)
-    if text_kw.strip():
-        q += " AND (nonconformity LIKE ? OR description LIKE ? OR reporter LIKE ? OR type LIKE ?)"
-        params.extend([f"%{text_kw.strip()}%"] * 4)
-
-    if date_from:
-        q += " AND date(substr(created_at,1,10)) >= date(?)"
-        params.append(date_from.isoformat())
-    if date_to:
-        q += " AND date(substr(created_at,1,10)) <= date(?)"
-        params.append(date_to.isoformat())
-
-    q += " ORDER BY id DESC"
-    with get_conn() as c:
-        return pd.read_sql_query(q, c, params=params)
-
-def clear_caches():
-    list_models_df.clear()
-    query_firstpiece.clear()
-    query_nonconf.clear()
-
-# =============================================================================
-# ------------------------------ DB WRITERS -----------------------------------
-# =============================================================================
 def upsert_model(model_no: str, name: str = ""):
     with get_conn() as c:
         c.execute(
-            """INSERT INTO models(model_no, name) VALUES(?,?)
+            """INSERT INTO models(model_no, name) VALUES(?, ?)
                ON CONFLICT(model_no) DO UPDATE SET name=excluded.name""",
             (model_no.strip(), name.strip()),
         )
         c.commit()
-    list_models_df.clear()
 
-def insert_firstpiece(payload: Dict[str, Any]):
-    cols = [
-        "created_at","model_no","model_version","sn","mo",
-        "reporter","description","top_image","bottom_image","extra"
-    ]
-    vals = [payload.get(k) for k in cols]
+def insert_first_piece(payload: dict):
     with get_conn() as c:
         c.execute(
-            f"INSERT INTO first_piece({','.join(cols)}) VALUES({','.join(['?']*len(cols))})",
-            vals,
+            """INSERT INTO first_piece
+               (created_at, model_no, model_version, sn, mo, reporter, notes,
+                top_image_path, bottom_image_path, extra)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload.get("created_at"), payload.get("model_no"),
+                payload.get("model_version"), payload.get("sn"),
+                payload.get("mo"), payload.get("reporter"),
+                payload.get("notes"), payload.get("top_image_path"),
+                payload.get("bottom_image_path"),
+                json.dumps(payload.get("extra") or {}, ensure_ascii=False),
+            ),
         )
         c.commit()
-    query_firstpiece.clear()
 
-def insert_nonconf(payload: Dict[str, Any]):
-    cols = [
-        "created_at","model_no","model_version","sn","mo","reporter",
-        "nonconformity","description","type","image_path","images","raw"
-    ]
-    vals = [payload.get(k) for k in cols]
+def insert_nonconf(payload: dict):
     with get_conn() as c:
         c.execute(
-            f"INSERT INTO nonconformities({','.join(cols)}) VALUES({','.join(['?']*len(cols))})",
-            vals,
+            """INSERT INTO nonconformities
+               (created_at, model_no, model_version, sn, mo, reporter, severity,
+                description, top_image_path, bottom_image_path, extra)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload.get("created_at"), payload.get("model_no"),
+                payload.get("model_version"), payload.get("sn"),
+                payload.get("mo"), payload.get("reporter"),
+                payload.get("severity"), payload.get("description"),
+                payload.get("top_image_path"), payload.get("bottom_image_path"),
+                json.dumps(payload.get("extra") or {}, ensure_ascii=False),
+            ),
         )
         c.commit()
-    query_nonconf.clear()
 
-def append_nonconf_image(nid: int, rel_path: str):
+def update_row_photo(table: str, row_id: int, where_slot: str, rel_path: str):
+    col = "top_image_path" if where_slot == "top" else "bottom_image_path"
     with get_conn() as c:
-        row = c.execute("SELECT images FROM nonconformities WHERE id=?", (nid,)).fetchone()
-        images = []
-        if row and row[0]:
+        c.execute(f"UPDATE {table} SET {col}=? WHERE id=?", (rel_path, row_id))
+        c.commit()
+
+def delete_row(table: str, row_id: int):
+    with get_conn() as c:
+        c.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+        c.commit()
+
+# --- loaders (cached) ---
+
+@st.cache_data(show_spinner=False)
+def load_first_piece(filters: dict):
+    q = "SELECT * FROM first_piece WHERE 1=1"
+    params = []
+    if filters.get("model"):
+        q += " AND model_no LIKE ?"; params.append(f"%{filters['model']}%")
+    if filters.get("version"):
+        q += " AND model_version LIKE ?"; params.append(f"%{filters['version']}%")
+    if filters.get("sn"):
+        q += " AND sn LIKE ?"; params.append(f"%{filters['sn']}%")
+    if filters.get("mo"):
+        q += " AND mo LIKE ?"; params.append(f"%{filters['mo']}%")
+    if filters.get("text"):
+        q += " AND (notes LIKE ? OR reporter LIKE ?)"
+        params += [f"%{filters['text']}%", f"%{filters['text']}%"]
+    if filters.get("date_from"): q += " AND date(created_at) >= ?"; params.append(filters["date_from"])
+    if filters.get("date_to"):   q += " AND date(created_at) <= ?"; params.append(filters["date_to"])
+    q += " ORDER BY id DESC"
+    with get_conn() as c:
+        return pd.read_sql_query(q, c, params=params)
+
+@st.cache_data(show_spinner=False)
+def load_nonconf(filters: dict):
+    q = "SELECT * FROM nonconformities WHERE 1=1"
+    params = []
+    if filters.get("model"):
+        q += " AND model_no LIKE ?"; params.append(f"%{filters['model']}%")
+    if filters.get("version"):
+        q += " AND model_version LIKE ?"; params.append(f"%{filters['version']}%")
+    if filters.get("sn"):
+        q += " AND sn LIKE ?"; params.append(f"%{filters['sn']}%")
+    if filters.get("mo"):
+        q += " AND mo LIKE ?"; params.append(f"%{filters['mo']}%")
+    if filters.get("text"):
+        q += " AND (description LIKE ? OR reporter LIKE ? OR severity LIKE ?)"
+        params += [f"%{filters['text']}%", f"%{filters['text']}%", f"%{filters['text']}%"]
+    if filters.get("date_from"): q += " AND date(created_at) >= ?"; params.append(filters["date_from"])
+    if filters.get("date_to"):   q += " AND date(created_at) <= ?"; params.append(filters["date_to"])
+    q += " ORDER BY id DESC"
+    with get_conn() as c:
+        return pd.read_sql_query(q, c, params=params)
+
+# ============ UI ============
+
+init_db()
+st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
+
+# subtle compacting CSS for filters + cards
+st.markdown("""
+<style>
+.small * {font-size: 0.87rem !important;}
+.card {padding: .6rem 1rem; border: 1px solid #e6e6e6; border-radius: 10px; margin-bottom: .8rem;}
+.card h4 {margin: .2rem 0 .5rem 0;}
+.card .caps {color:#57606a; font-weight:600;}
+img {border-radius: 6px;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Quality Portal - Pilot")
+
+# ---------- Sidebar: Create ----------
+
+with st.sidebar:
+    st.header("➕ Create / Upload")
+
+    with st.expander("First Piece (TOP & BOTTOM)", expanded=False):
+        f_m = st.text_input("Model")
+        f_v = st.text_input("Model Version")
+        f_sn = st.text_input("SN / Barcode")
+        f_mo = st.text_input("MO / Work Order")
+        f_notes = st.text_area("Notes")
+        colu = st.columns(2)
+        with colu[0]:
+            f_top = st.file_uploader("TOP photo", type=["jpg","jpeg","png"], key="fp_top")
+        with colu[1]:
+            f_bot = st.file_uploader("BOTTOM photo", type=["jpg","jpeg","png"], key="fp_bot")
+        if st.button("Save First Piece", use_container_width=True):
+            if not f_m.strip():
+                st.error("Model is required.")
+            else:
+                top_rel = save_image(f_m, f_top) if f_top else None
+                bot_rel = save_image(f_m, f_bot) if f_bot else None
+                insert_first_piece({
+                    "created_at": now_iso(), "model_no": f_m, "model_version": f_v,
+                    "sn": f_sn, "mo": f_mo, "reporter": current_user(),
+                    "notes": f_notes, "top_image_path": top_rel, "bottom_image_path": bot_rel,
+                    "extra": {}
+                })
+                st.success("Saved.")
+                load_first_piece.clear()
+
+    with st.expander("Non-Conformity (aligned to Excel)", expanded=False):
+        n_model = st.text_input("Model/Part No.")
+        n_version = st.text_input("Version (optional)")
+        n_customer = st.text_input("Customer/Supplier")
+        n_mo = st.text_input("MO/PO")
+        n_sn = st.text_input("SN (optional)")
+        n_line = st.text_input("Line")
+        n_ws = st.text_input("Work Station")
+        n_unit = st.text_input("Unit Head")
+        n_resp = st.text_input("Responsibility")
+        n_rc = st.text_input("Root Cause")
+        n_ca = st.text_input("Corrective Action")
+        n_sev = st.selectbox("Severity / Type", ["Minor","Major","Critical","Info"], index=0)
+        n_desc = st.text_area("Description of Nonconformity")
+        cc = st.columns(2)
+        with cc[0]:
+            n_top = st.file_uploader("TOP photo", type=["jpg","jpeg","png"], key="nc_top")
+        with cc[1]:
+            n_bot = st.file_uploader("BOTTOM photo", type=["jpg","jpeg","png"], key="nc_bot")
+        if st.button("Save Non-Conformity", use_container_width=True):
+            if not n_model.strip():
+                st.error("Model/Part No. is required.")
+            else:
+                top_rel = save_image(n_model, n_top) if n_top else None
+                bot_rel = save_image(n_model, n_bot) if n_bot else None
+                insert_nonconf({
+                    "created_at": now_iso(), "model_no": n_model, "model_version": n_version,
+                    "sn": n_sn, "mo": n_mo, "reporter": current_user(), "severity": n_sev,
+                    "description": n_desc, "top_image_path": top_rel, "bottom_image_path": bot_rel,
+                    "extra": {
+                        "Customer/Supplier": n_customer, "Line": n_line, "Work Station": n_ws,
+                        "Unit Head": n_unit, "Responsibility": n_resp, "Root Cause": n_rc,
+                        "Corrective Action": n_ca
+                    }
+                })
+                st.success("Saved.")
+                load_nonconf.clear()
+
+    with st.expander("Import Non-Conformities (CSV/XLSX)", expanded=False):
+        st.caption("Headers supported (any order): Nonconformity, Description of Nonconformity, Date, Customer/Supplier, Model/Part No., MO/PO, Line, Work Station, Unit Head, Responsibility, Root Cause, Corrective Action, Exception reporters, Discovery, Origil Sources, Defective Item, Defective Item (2), Defective Outflow, Defective Qty, Inspection Qty, Lot Qty")
+        upf = st.file_uploader("Upload file", type=["csv","xlsx"])
+        if upf is not None:
             try:
-                images = json.loads(row[0])
-            except Exception:
-                images = []
-        images.append(rel_path)
-        c.execute("UPDATE nonconformities SET images=? WHERE id=?", (json.dumps(images), nid))
-        c.commit()
-    query_nonconf.clear()
+                if upf.name.lower().endswith(".xlsx"):
+                    df = pd.read_excel(upf, engine="openpyxl")
+                else:
+                    # robust CSV decoding
+                    _bytes = upf.getvalue()
+                    for enc in ("utf-8-sig", "utf-8", "big5", "cp950"):
+                        try:
+                            df = pd.read_csv(io.BytesIO(_bytes), encoding=enc)
+                            break
+                        except Exception:
+                            df = None
+                    if df is None:
+                        df = pd.read_csv(io.BytesIO(_bytes), encoding="utf-8", errors="ignore")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+                df = None
 
-def delete_firstpiece(fid: int):
-    with get_conn() as c:
-        c.execute("DELETE FROM first_piece WHERE id=?", (fid,))
-        c.commit()
-    query_firstpiece.clear()
+            if df is not None and not df.empty:
+                # Normalize columns (strip and lower)
+                rename = {c.strip(): c.strip() for c in df.columns if isinstance(c, str)}
+                df = df.rename(columns=rename)
 
-def delete_nonconf(nid: int):
-    with get_conn() as c:
-        c.execute("DELETE FROM nonconformities WHERE id=?", (nid,))
-        c.commit()
-    query_nonconf.clear()
+                # mapping from your Excel headers to our fields / extra
+                COLS = {
+                    "Model/Part No.": "model_no",
+                    "MO/PO": "mo",
+                    "Customer/Supplier": ("extra", "Customer/Supplier"),
+                    "Description of Nonconformity": "description",
+                    "Nonconformity": ("extra","Nonconformity"),
+                    "Date": "created_at",
+                    "Line": ("extra","Line"),
+                    "Work Station": ("extra","Work Station"),
+                    "Unit Head": ("extra","Unit Head"),
+                    "Responsibility": ("extra","Responsibility"),
+                    "Root Cause": ("extra","Root Cause"),
+                    "Corrective Action": ("extra","Corrective Action"),
+                    "Exception reporters": ("extra","Exception reporters"),
+                    "Discovery": ("extra","Discovery"),
+                    "Origil Sources": ("extra","Origil Sources"),
+                    "Defective Item": ("extra","Defective Item"),
+                    "Defective Outflow": ("extra","Defective Outflow"),
+                    "Defective Qty": ("extra","Defective Qty"),
+                    "Inspection Qty": ("extra","Inspection Qty"),
+                    "Lot Qty": ("extra","Lot Qty"),
+                }
 
-# =============================================================================
-# ------------------------------ CSV MAPPING ----------------------------------
-# =============================================================================
-# Flexible column aliases for import
-ALIASES = {
-    "date": ["date", "週數", "月份", "發生日期", "回覆日期", "Date", "時間"],
-    "model_no": ["Model", "機種/料號", "model_no", "機種", "料號"],
-    "model_version": ["Model Version", "型號版本", "版本", "型號", "Model Version (full)"],
-    "sn": ["SN", "序號", "Barcode", "條碼"],
-    "mo": ["MO", "MO/PO", "PO", "工單/採購單號", "工單", "MO/Working Order"],
-    "nonconformity": ["不符合分類", "Nonconformity", "異常分類", "Defective Item", "異常項目"],
-    "description": ["不符合說明", "Description of Nonconformity", "描述", "說明", "description"],
-    "type": ["Category", "Severity", "類別", "嚴重度", "類型"],
-    "reporter": ["提報人員", "Exception reporters", "Reporter", "檢查員", "檢驗人員"],
+                imported = 0
+                for _, row in df.iterrows():
+                    payload = {
+                        "created_at": None, "model_no": "", "model_version": "",
+                        "sn": "", "mo": "", "reporter": current_user(), "severity": "",
+                        "description": "", "top_image_path": None, "bottom_image_path": None,
+                        "extra": {}
+                    }
+                    for col, key in COLS.items():
+                        if col not in df.columns: 
+                            continue
+                        val = row.get(col, None)
+                        if pd.isna(val): 
+                            continue
+                        if key == "created_at":
+                            # normalize date
+                            try:
+                                payload["created_at"] = pd.to_datetime(val).strftime("%Y-%m-%d")
+                            except Exception:
+                                payload["created_at"] = str(val)
+                        elif key == "model_no":
+                            payload["model_no"] = str(val).strip()
+                        elif key == "mo":
+                            payload["mo"] = str(val).strip()
+                        elif key == "description":
+                            payload["description"] = str(val).strip()
+                        elif isinstance(key, tuple) and key[0] == "extra":
+                            payload["extra"][key[1]] = str(val)
+
+                    if not payload["created_at"]:
+                        payload["created_at"] = now_iso()
+                    insert_nonconf(payload)
+                    # also keep models list up-to-date
+                    if payload["model_no"]:
+                        upsert_model(payload["model_no"])
+                    imported += 1
+
+                st.success(f"Imported {imported} row(s).")
+                load_nonconf.clear()
+
+# ---------- Search & View ----------
+
+st.subheader("🔎 Search & View")
+with st.container():
+    with st.container():
+        st.markdown('<div class="small">', unsafe_allow_html=True)
+        fc1, fc2, fc3, fc4, fc5, fc6, fc7 = st.columns([1,1,1,1,2,1,1])
+        with fc1: f_model = st.text_input("Model contains")
+        with fc2: f_version = st.text_input("Version contains")
+        with fc3: f_sn = st.text_input("SN contains")
+        with fc4: f_mo = st.text_input("MO contains")
+        with fc5: f_text = st.text_input("Text in description/reporter/type")
+        with fc6: f_from = st.date_input("From", value=None, format="YYYY-MM-DD")
+        with fc7: f_to = st.date_input("To", value=None, format="YYYY-MM-DD")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+filters = {
+    "model": f_model.strip() if f_model else "",
+    "version": f_version.strip() if f_version else "",
+    "sn": f_sn.strip() if f_sn else "",
+    "mo": f_mo.strip() if f_mo else "",
+    "text": f_text.strip() if f_text else "",
+    "date_from": str(f_from) if isinstance(f_from, date) else None,
+    "date_to": str(f_to) if isinstance(f_to, date) else None,
 }
 
-def resolve(df: pd.DataFrame, key: str) -> str | None:
-    for cand in ALIASES.get(key, []):
-        if cand in df.columns:
-            return cand
-    return None
-    
-# Try multiple encodings for CSVs (Big5/GBK/Shift-JIS/Windows/etc)
-def _read_csv_with_encodings(file_bytes: bytes) -> tuple[pandas.DataFrame, str]:
-    import io
-    encodings = [
-        "utf-8-sig", "utf-8",
-        "cp950", "big5",            # Traditional Chinese
-        "gbk", "gb2312",            # Simplified Chinese
-        "shift_jis", "cp932",       # Japanese
-        "cp1252", "latin1",         # Windows Western
-        "utf-16", "utf-16le", "utf-16be",
-    ]
-    errors = []
-    for enc in encodings:
-        try:
-            bio = io.BytesIO(file_bytes)
-            # engine='python' is more tolerant of odd delimiters
-            df = pd.read_csv(bio, encoding=enc, engine="python")
-            return df, enc
-        except Exception as e:
-            errors.append(f"{enc}: {e}")
-    raise ValueError("Could not decode CSV with common encodings:\n  " + "\n  ".join(errors))
+# Tabs: First Piece / Nonconformities
+t1, t2 = st.tabs(["First Piece", "Non-Conformities"])
 
-def import_nonconf_csv(file) -> tuple[int, list[str]]:
-    """
-    Import non-conformities from CSV or Excel. Auto-detect CSV encodings.
-    Returns (rows_imported, warnings).
-    """
-    # Read into DataFrame (CSV with multi-encoding or Excel)
-    if file.name.lower().endswith(".csv"):
-        raw = file.read()  # bytes
-        df, used_enc = _read_csv_with_encodings(raw)
-        st.toast(f"CSV decoded as {used_enc}", icon="🗂️")
-    else:
-        file.seek(0)
-        df = pd.read_excel(file)  # needs openpyxl
+def _render_photos(right_col, top_rel, bottom_rel):
+    # draw both images side by side or show placeholders
+    cc = right_col.columns(2, gap="small")
+    if top_rel:
+        p = DATA_DIR / top_rel
+        if p.exists():
+            cc[0].image(str(p), use_container_width=True, caption="TOP")
+    if bottom_rel:
+        p = DATA_DIR / bottom_rel
+        if p.exists():
+            cc[1].image(str(p), use_container_width=True, caption="BOTTOM")
 
-    df.columns = [str(c).strip() for c in df.columns]
+with t1:
+    fdf = load_first_piece(filters)
+    st.caption(f"{len(fdf)} record(s)")
+    for _, r in fdf.iterrows():
+        with st.container():
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            # compact header
+            st.markdown(
+                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
+                f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+            )
+            st.caption(f"🕒 {r['created_at']}   👤 {r['reporter']}")
+            cols = st.columns([3,2], gap="large")
+            with cols[0]:
+                st.write(r["notes"] or "")
+            with cols[1]:
+                _render_photos(cols[1], r.get("top_image_path"), r.get("bottom_image_path"))
+                # Add photo later
+                ap = st.file_uploader("Add photo", type=["jpg","jpeg","png"], key=f"fp_add_{r['id']}")
+                if ap is not None:
+                    rel = save_image(r["model_no"] or "_misc", ap)
+                    # put to TOP if empty else to BOTTOM
+                    slot = "top" if not r.get("top_image_path") else "bottom"
+                    update_row_photo("first_piece", int(r["id"]), slot, rel)
+                    st.success("Photo added.")
+                    load_first_piece.clear()
+            col2 = st.columns([6,1])
+            with col2[1]:
+                if st.button("Delete", key=f"del_fp_{r['id']}", use_container_width=True):
+                    delete_row("first_piece", int(r["id"]))
+                    load_first_piece.clear()
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    # Use your existing ALIASES + resolve() helpers
-    def resolve(df_: pd.DataFrame, key: str) -> str | None:
-        for cand in ALIASES.get(key, []):
-            if cand in df_.columns:
-                return cand
-        return None
+    with st.expander("Table view & export (First Piece)", expanded=False):
+        if not fdf.empty:
+            st.dataframe(fdf.drop(columns=["extra"]), use_container_width=True, hide_index=True)
+            st.download_button("Export CSV", fdf.to_csv(index=False).encode("utf-8"),
+                               "first_piece.csv", "text/csv")
 
-    col = {k: resolve(df, k) for k in ALIASES.keys()}
-    msgs: list[str] = []
-    count = 0
-
-    for _, r in df.iterrows():
-        created = try_parse_date(r.get(col["date"])) or date.today()
-
-        payload = {
-            "created_at": created.isoformat(),
-            "model_no":       str(r.get(col["model_no"]))       if col["model_no"]       else "",
-            "model_version":  str(r.get(col["model_version"]))  if col["model_version"]  else "",
-            "sn":             str(r.get(col["sn"]))             if col["sn"]             else "",
-            "mo":             str(r.get(col["mo"]))             if col["mo"]             else "",
-            "reporter":       str(r.get(col["reporter"]))       if col["reporter"]       else safe_user(),
-            "nonconformity":  str(r.get(col["nonconformity"]))  if col["nonconformity"]  else "",
-            "description":    str(r.get(col["description"]))    if col["description"]    else "",
-            "type":           str(r.get(col["type"]))           if col["type"]           else "",
-            "image_path": "",
-            "images": json.dumps([]),
-            "raw": r.to_json(force_ascii=False),  # keep entire original row
-        }
-
-        try:
-            insert_nonconf(payload)
-            count += 1
-        except Exception as e:
-            msgs.append(f"Row import failed: {e}")
-
-    query_nonconf.clear()  # refresh the results cache
-    return count, msgs
-
-# =============================================================================
-# --------------------------------- UI ----------------------------------------
-# =============================================================================
-st.set_page_config(page_title=APP_NAME, layout="wide")
-st.markdown(
-    """
-    <style>
-      /* Smaller filter inputs & labels */
-      .small * {font-size: 0.92rem !important;}
-      .muted { color: #6b7280; font-size: 0.92rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title(APP_NAME)
-
-# ----------------------------- SIDEBAR ---------------------------------------
-with st.sidebar:
-    st.header("Admin / Data Entry")
-
-    # -- Add / Update Model --
-    with st.expander("Add / Update Model", expanded=False):
-        with st.form("f_model", clear_on_submit=True):
-            m_no = st.text_input("Model short (e.g., 190-56980)")
-            m_name = st.text_input("Name / Customer (optional)")
-            ok = st.form_submit_button("Save model")
-            if ok:
-                if m_no.strip():
-                    upsert_model(m_no, m_name)
-                    st.success("Model saved.")
-                else:
-                    st.error("Model cannot be empty.")
-
-    # -- First Piece entry --
-    with st.expander("Create First Piece", expanded=False):
-        with st.form("f_fp", clear_on_submit=True):
-            fp_model = st.text_input("Model")
-            fp_version = st.text_input("Model Version (full)")
-            fp_sn = st.text_input("SN / Barcode")
-            fp_mo = st.text_input("MO / Work Order")
-            fp_desc = st.text_area("Description / Notes")
-            colu = st.columns(2)
-            with colu[0]:
-                up_top = st.file_uploader("TOP photo", type=["jpg","jpeg","png"], key="up_top")
-            with colu[1]:
-                up_bot = st.file_uploader("BOTTOM photo", type=["jpg","jpeg","png"], key="up_bot")
-            ok2 = st.form_submit_button("Save First Piece")
-            if ok2:
-                if not fp_model.strip():
-                    st.error("Model is required.")
-                else:
-                    top_rel = save_image(fp_model.strip(), up_top) if up_top else ""
-                    bot_rel = save_image(fp_model.strip(), up_bot) if up_bot else ""
-                    insert_firstpiece({
-                        "created_at": now_iso(),
-                        "model_no": fp_model.strip(),
-                        "model_version": fp_version.strip(),
-                        "sn": fp_sn.strip(),
-                        "mo": fp_mo.strip(),
-                        "reporter": safe_user(),
-                        "description": fp_desc.strip(),
-                        "top_image": top_rel,
-                        "bottom_image": bot_rel,
-                        "extra": json.dumps({}),
-                    })
-                    st.success("First Piece saved.")
-
-    # -- Non-Conformity entry (manual) --
-    with st.expander("Create Non-Conformity", expanded=False):
-        with st.form("f_nc", clear_on_submit=True):
-            nc_date = st.date_input("Date", value=date.today())
-            model = st.text_input("Model")
-            version = st.text_input("Model Version")
-            sn = st.text_input("SN")
-            mo = st.text_input("MO")
-            nctype = st.selectbox("Category / Severity", ["", "Minor", "Major", "Critical"])
-            title = st.text_input("Nonconformity")
-            desc = st.text_area("Description")
-            up_nc = st.file_uploader("Photo (optional)", type=["jpg","jpeg","png"])
-            ok3 = st.form_submit_button("Save Non-Conformity")
-            if ok3:
-                image_rel = save_image(model.strip() or "nonconformity", up_nc) if up_nc else ""
-                insert_nonconf({
-                    "created_at": nc_date.isoformat(),
-                    "model_no": model.strip(),
-                    "model_version": version.strip(),
-                    "sn": sn.strip(),
-                    "mo": mo.strip(),
-                    "reporter": safe_user(),
-                    "nonconformity": title.strip(),
-                    "description": desc.strip(),
-                    "type": nctype.strip(),
-                    "image_path": image_rel,
-                    "images": json.dumps([image_rel] if image_rel else []),
-                    "raw": json.dumps({}),
-                })
-                st.success("Non-Conformity saved.")
-
-    # -- Non-Conformity import CSV/Excel --
-    with st.expander("Import Non-Conformities (CSV/Excel)", expanded=False):
-        with st.form("f_nc_import", clear_on_submit=True):
-            up_csv = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"])
-            ok4 = st.form_submit_button("Import")
-            if ok4:
-                if up_csv is None:
-                    st.error("Please choose a file to import.")
-                else:
-                    try:
-                        n, msgs = import_nonconf_csv(up_csv)
-                        st.success(f"Imported {n} rows.")
-                        if msgs:
-                            with st.expander("Import warnings"):
-                                for m in msgs:
-                                    st.write("•", m)
-                    except Exception as e:
-                        st.error(f"Import failed: {e}")
-
-# ----------------------------- SEARCH & VIEW ---------------------------------
-st.subheader("🔎 Search & View", divider="gray")
-
-with st.container():
-    st.markdown('<div class="small">', unsafe_allow_html=True)
-    c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.2, 1, 1, 1.5, 1.5])
-    with c1:
-        f_model = st.text_input("Model contains", "")
-    with c2:
-        f_version = st.text_input("Version contains", "")
-    with c3:
-        f_sn = st.text_input("SN contains", "")
-    with c4:
-        f_mo = st.text_input("MO contains", "")
-    with c5:
-        f_text = st.text_input("Text in description/reporter/type", "")
-    with c6:
-        dcol1, dcol2 = st.columns(2)
-        with dcol1:
-            f_from = st.date_input("From", value=None, format="YYYY-MM-DD")
-        with dcol2:
-            f_to = st.date_input("To", value=None, format="YYYY-MM-DD")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------- First Piece Results ----------
-fp_df = query_firstpiece(f_model, f_version, f_sn, f_mo, f_text, f_from, f_to)
-with st.expander(f"📁 First Piece (results) – {len(fp_df)} record(s)", expanded=True):
-    if fp_df.empty:
-        st.caption("No first-piece records.")
-    else:
-        for _, r in fp_df.iterrows():
-            with st.container(border=True):
-                top_path = DATA_DIR / str(r["top_image"]) if r.get("top_image") else None
-                bot_path = DATA_DIR / str(r["bottom_image"]) if r.get("bottom_image") else None
-                cimg = st.columns(2)
-                with cimg[0]:
-                    if top_path and top_path.exists():
-                        st.image(str(top_path), use_column_width=True, caption="TOP")
-                with cimg[1]:
-                    if bot_path and bot_path.exists():
-                        st.image(str(bot_path), use_column_width=True, caption="BOTTOM")
-
-                st.markdown(
-                    f"**Model:** {r['model_no'] or '-'} | "
-                    f"**Version:** {r['model_version'] or '-'} | "
-                    f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
-                )
-                st.caption(f"🕒 {r['created_at']}  ·  👤 Reporter: {r['reporter'] or safe_user()}")
-                st.write(r["description"] or "*No description*")
-                if st.button("Delete", key=f"del_fp_{r['id']}"):
-                    delete_firstpiece(int(r["id"]))
-                    st.rerun()
-
-# Toggle for table & export (avoid nested-block/expander problems)
-st.subheader("First Piece – Table & Export", divider="gray")
-if st.toggle("Show table & export", key="fp_tbl_tog"):
-    st.dataframe(fp_df, use_column_width=True, hide_index=True)
-    if not fp_df.empty:
-        csv = fp_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Download CSV", data=csv, file_name="first_piece_export.csv", mime="text/csv")
-
-# ---------- Non-Conformities Results ----------
-nc_df = query_nonconf(f_model, f_version, f_sn, f_mo, f_text, f_from, f_to)
-with st.expander(f"🧭 Non-Conformities (results) – {len(nc_df)} record(s)", expanded=True):
-    if nc_df.empty:
-        st.caption("No non-conformities.")
-    else:
-        for _, r in nc_df.iterrows():
-            with st.container(border=True):
-                row = dict(r)
-
-                # Head line
-                st.markdown(
-                    f"**Model:** {row.get('model_no') or '-'} | "
-                    f"**Version:** {row.get('model_version') or '-'} | "
-                    f"**SN:** {row.get('sn') or '-'} | **MO:** {row.get('mo') or '-'}"
-                )
-
-                # info line
-                imgs = []
+with t2:
+    ndf = load_nonconf(filters)
+    st.caption(f"{len(ndf)} record(s)")
+    for _, r in ndf.iterrows():
+        with st.container():
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(
+                f"**Model:** {r['model_no'] or '-'} | **Version:** {r['model_version'] or '-'} | "
+                f"**SN:** {r['sn'] or '-'} | **MO:** {r['mo'] or '-'}"
+            )
+            sev = r.get("severity") or ""
+            st.caption(f"🕒 {r['created_at']}   👤 {r['reporter']}   ·   {sev}")
+            cols = st.columns([3,2], gap="large")
+            with cols[0]:
+                st.write(r["description"] or "")
+                # show a few important extras if present
                 try:
-                    imgs = json.loads(row.get("images") or "[]")
+                    ex = json.loads(r.get("extra") or "{}")
                 except Exception:
-                    imgs = []
+                    ex = {}
+                highlights = []
+                for key in ("Customer/Supplier","Line","Work Station","Unit Head",
+                            "Responsibility","Root Cause"):
+                    if ex.get(key):
+                        highlights.append(f"**{key}:** {ex[key]}")
+                if highlights:
+                    st.markdown("  \n".join(highlights))
+            with cols[1]:
+                _render_photos(cols[1], r.get("top_image_path"), r.get("bottom_image_path"))
+                ap2 = st.file_uploader("Add photo", type=["jpg","jpeg","png"], key=f"nc_add_{r['id']}")
+                if ap2 is not None:
+                    rel = save_image(r["model_no"] or "_misc", ap2)
+                    slot = "top" if not r.get("top_image_path") else "bottom"
+                    update_row_photo("nonconformities", int(r["id"]), slot, rel)
+                    st.success("Photo added.")
+                    load_nonconf.clear()
+            col2 = st.columns([6,1])
+            with col2[1]:
+                if st.button("Delete", key=f"del_nc_{r['id']}", use_container_width=True):
+                    delete_row("nonconformities", int(r["id"]))
+                    load_nonconf.clear()
+            st.markdown('</div>', unsafe_allow_html=True)
 
-                ic = st.columns([1.2, 6, 1.2, 1.2])
-                with ic[0]:
-                    st.caption(f"🕒 {row.get('created_at') or ''}")
-                with ic[1]:
-                    st.caption(f"👤 {row.get('reporter') or safe_user()}  |  🏷 {row.get('type') or ''}")
-                with ic[2]:
-                    # add photo button/uploader
-                    addf = st.file_uploader("Add photo", type=["jpg","jpeg","png"], key=f"addp_{r['id']}")
-                    if addf:
-                        rel = save_image(row.get("model_no") or "nonconformity", addf)
-                        append_nonconf_image(int(row["id"]), rel)
-                        st.success("Photo added.")
-                        st.rerun()
-                with ic[3]:
-                    if st.button("Delete", key=f"del_nc_{r['id']}"):
-                        delete_nonconf(int(r["id"]))
-                        st.rerun()
-
-                # images row
-                if row.get("image_path"):
-                    p0 = DATA_DIR / str(row["image_path"])
-                    if p0.exists():
-                        st.image(str(p0), use_column_width=True)
-
-                if imgs:
-                    gcols = st.columns(min(4, len(imgs)))
-                    for i, rel in enumerate(imgs[:4]):
-                        p = DATA_DIR / rel
-                        with gcols[i % len(gcols)]:
-                            if p.exists():
-                                st.image(str(p), use_column_width=True)
-
-                # text area
-                st.markdown(f"**{row.get('nonconformity') or ''}**")
-                st.write(row.get("description") or "*No description*")
-
-# Toggle for table & export (avoid nested block)
-st.subheader("Non-Conformities – Table & Export", divider="gray")
-if st.toggle("Show table & export", key="nc_tbl_tog"):
-    st.dataframe(nc_df, use_column_width=True, hide_index=True)
-    if not nc_df.empty:
-        csv = nc_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Download CSV", data=csv, file_name="nonconformities_export.csv", mime="text/csv")
+    with st.expander("Table view & export (Non-Conformities)", expanded=False):
+        if not ndf.empty:
+            st.dataframe(ndf.drop(columns=["extra"]), use_container_width=True, hide_index=True)
+            st.download_button("Export CSV", ndf.to_csv(index=False).encode("utf-8"),
+                               "nonconformities.csv", "text/csv")
