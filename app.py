@@ -1,5 +1,5 @@
-# QC Portal v1 — Models + First Piece + History
-# storage is Cloud-safe (/mount/data if available, else /tmp/qc_portal)
+# QC Portal v1.1 — Models + First Piece + History
+# Storage: /mount/data if available (Streamlit Cloud), else /tmp/qc_portal
 
 import os
 import io
@@ -14,6 +14,7 @@ from PIL import Image
 
 # ------------------ storage (Cloud-safe) ------------------
 def pick_data_dir() -> Path:
+    """Return a writable base dir."""
     for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
         try:
             base.mkdir(parents=True, exist_ok=True)
@@ -160,14 +161,22 @@ with st.sidebar:
 
     # Pick a model radio
     models = list_models_df()
+    picked = None
     if models.empty:
         st.info("No models yet. Add one above.")
-        picked = None
     else:
-        labels = [f"{r.model_no}  •  {r.name}" if r.name else r.model_no for _, r in models.iterrows()]
-        picked = st.radio("Select a model", options=models["model_no"].tolist(),
-                          format_func=lambda m: next((lab for lab, row_m in zip(labels, models["model_no"]) if row_m == m), m),
-                          key="picked_model")
+        options = models["model_no"].tolist()
+        labels = [
+            f"{row.model_no}  •  {row.name}" if row.name else row.model_no
+            for _, row in models.iterrows()
+        ]
+        label_map = dict(zip(options, labels))
+        picked = st.radio(
+            "Select a model",
+            options=options,
+            format_func=lambda m: label_map.get(m, m),
+            key="picked_model",
+        )
 
     st.divider()
 
@@ -179,7 +188,11 @@ with st.sidebar:
         fp_sn = st.text_input("SN / Barcode")
         fp_mo = st.text_input("MO / Work Order")
         fp_desc = st.text_area("Notes (optional)")
-        up_imgs = st.file_uploader("Upload photo(s) (Top / Bottom)", type=["jpg","jpeg","png"], accept_multiple_files=True)
+        up_imgs = st.file_uploader(
+            "Upload photo(s) (Top / Bottom)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+        )
         submitted = st.form_submit_button("Save first piece")
         if submitted:
             if not (fp_model or "").strip():
@@ -193,7 +206,7 @@ with st.sidebar:
                     try:
                         rel_paths.append(save_image(fp_model.strip(), uf))
                     except Exception as e:
-                        st.error(f"Failed saving {uf.name}: {e}")
+                        st.error(f"Failed saving {getattr(uf, 'name', 'image')}: {e}")
                         rel_paths = []
                         break
                 if rel_paths:
@@ -211,8 +224,17 @@ with st.sidebar:
                     insert_finding(payload)
                     st.success("Saved first piece!")
                     load_findings_df.clear()
-                    # also ensure model exists
-                    upsert_model(fp_model.strip(), models.set_index("model_no").get("name", pd.Series()).get(fp_model.strip(), ""))  # safe
+
+                    # also ensure model exists (carry existing name if present)
+                    name_val = ""
+                    if not models.empty and fp_model.strip() in set(models["model_no"]):
+                        try:
+                            name_val = models.loc[
+                                models["model_no"] == fp_model.strip(), "name"
+                            ].iloc[0]
+                        except Exception:
+                            name_val = ""
+                    upsert_model(fp_model.strip(), name_val)
                     list_models_df.clear()
 
 # -------- Main: history for selected model --------
@@ -229,14 +251,22 @@ if picked:
                 with cols[0]:
                     p = DATA_DIR / str(r["image_path"]) if r["image_path"] else None
                     if p and p.exists():
+                        # st.image supports use_column_width=True on 1.36
                         st.image(str(p), use_column_width=True)
                 with cols[1]:
-                    st.markdown(f"**Version:** {r['model_version'] or '-'}  |  **SN:** {r['sn'] or '-'}  |  **MO:** {r['mo'] or '-'}")
-                    st.caption(f"{r['created_at']}  ·  Reporter: {r['reporter']}")
-                    if r.get("description"):
-                        st.write(r["description"])
+                    st.markdown(
+                        f"**Version:** {r.get('model_version', '') or '-'}  |  "
+                        f"**SN:** {r.get('sn', '') or '-'}  |  "
+                        f"**MO:** {r.get('mo', '') or '-'}"
+                    )
+                    st.caption(f"{r.get('created_at','')}  ·  Reporter: {r.get('reporter','')}")
+                    desc = r.get("description", "")
+                    if isinstance(desc, str) and desc.strip():
+                        st.write(desc)
+
         # table view under cards
         with st.expander("Show table"):
-            st.dataframe(fdf, use_column_width=True, hide_index=True)
+            # On Streamlit 1.36 use use_container_width (not use_column_width)
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
 else:
     st.info("Select a model in the sidebar to view its history.")
