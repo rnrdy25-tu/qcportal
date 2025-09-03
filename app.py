@@ -541,10 +541,10 @@ with st.expander(f"📁 First Piece (results) – {len(fp_df)} record(s)", expan
                 cimg = st.columns(2)
                 with cimg[0]:
                     if top_path and top_path.exists():
-                        st.image(str(top_path), use_container_width=True, caption="TOP")
+                        st.image(str(top_path), use_column_width=True, caption="TOP")
                 with cimg[1]:
                     if bot_path and bot_path.exists():
-                        st.image(str(bot_path), use_container_width=True, caption="BOTTOM")
+                        st.image(str(bot_path), use_column_width=True, caption="BOTTOM")
 
                 st.markdown(
                     f"**Model:** {r['model_no'] or '-'} | "
@@ -560,7 +560,7 @@ with st.expander(f"📁 First Piece (results) – {len(fp_df)} record(s)", expan
 # Toggle for table & export (avoid nested-block/expander problems)
 st.subheader("First Piece – Table & Export", divider="gray")
 if st.toggle("Show table & export", key="fp_tbl_tog"):
-    st.dataframe(fp_df, use_container_width=True, hide_index=True)
+    st.dataframe(fp_df, use_column_width=True, hide_index=True)
     if not fp_df.empty:
         csv = fp_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("Download CSV", data=csv, file_name="first_piece_export.csv", mime="text/csv")
@@ -611,7 +611,7 @@ with st.expander(f"🧭 Non-Conformities (results) – {len(nc_df)} record(s)", 
                 if row.get("image_path"):
                     p0 = DATA_DIR / str(row["image_path"])
                     if p0.exists():
-                        st.image(str(p0), use_container_width=True)
+                        st.image(str(p0), use_column_width=True)
 
                 if imgs:
                     gcols = st.columns(min(4, len(imgs)))
@@ -619,7 +619,7 @@ with st.expander(f"🧭 Non-Conformities (results) – {len(nc_df)} record(s)", 
                         p = DATA_DIR / rel
                         with gcols[i % len(gcols)]:
                             if p.exists():
-                                st.image(str(p), use_container_width=True)
+                                st.image(str(p), use_column_width=True)
 
                 # text area
                 st.markdown(f"**{row.get('nonconformity') or ''}**")
@@ -628,7 +628,7 @@ with st.expander(f"🧭 Non-Conformities (results) – {len(nc_df)} record(s)", 
 # Toggle for table & export (avoid nested block)
 st.subheader("Non-Conformities – Table & Export", divider="gray")
 if st.toggle("Show table & export", key="nc_tbl_tog"):
-    st.dataframe(nc_df, use_container_width=True, hide_index=True)
+    st.dataframe(nc_df, use_column_width=True, hide_index=True)
     if not nc_df.empty:
         csv = nc_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("Download CSV", data=csv, file_name="nonconformities_export.csv", mime="text/csv")
