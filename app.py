@@ -468,13 +468,13 @@ with tabs[0]:
             with cols[0]:
                 p_top = DATA_DIR / str(top_rel) if top_rel else None
                 if p_top and p_top.exists():
-                    st.image(str(p_top), use_container_width=True, caption="TOP")
+                    st.image(str(p_top), use_column_width=True, caption="TOP")
                 else:
                     st.caption("No TOP")
             with cols[1]:
                 p_bot = DATA_DIR / str(bot_rel) if bot_rel else None
                 if p_bot and p_bot.exists():
-                    st.image(str(p_bot), use_container_width=True, caption="BOTTOM")
+                    st.image(str(p_bot), use_column_width=True, caption="BOTTOM")
                 else:
                     st.caption("No BOTTOM")
             with cols[2]:
@@ -519,7 +519,7 @@ with tabs[1]:
             with cols[0]:
                 p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                 if p and p.exists():
-                    st.image(str(p), use_container_width=True)
+                    st.image(str(p), use_column_width=True)
                 else:
                     st.caption("No image")
             with cols[1]:
