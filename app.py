@@ -450,7 +450,7 @@ with st.expander("🗂️ Non-Conformities (results)", expanded=not nc_df.empty)
                 with cols[0]:
                     p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                     if p and p.exists():
-                        - st.image(str(p), use_container_width=True)
+                        - st.image(str(p), use_column_width=True)
                         + st.image(str(p), use_column_width=True)
                 with cols[1]:
                     st.markdown(
@@ -500,7 +500,7 @@ with st.expander("🗂️ First Piece (results)", expanded=not fp_df.empty):
                 with cols[0]:
                     p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                     if p and p.exists():
-                        - st.image(str(p), use_container_width=True)
+                        - st.image(str(p), use_column_width=True)
                         + st.image(str(p), use_column_width=True)
                 with cols[1]:
                     st.markdown(
