@@ -309,36 +309,81 @@ def resolve(df: pd.DataFrame, key: str) -> str | None:
         if cand in df.columns:
             return cand
     return None
+    
+# Try multiple encodings for CSVs (Big5/GBK/Shift-JIS/Windows/etc)
+def _read_csv_with_encodings(file_bytes: bytes) -> tuple[pandas.DataFrame, str]:
+    import io
+    encodings = [
+        "utf-8-sig", "utf-8",
+        "cp950", "big5",            # Traditional Chinese
+        "gbk", "gb2312",            # Simplified Chinese
+        "shift_jis", "cp932",       # Japanese
+        "cp1252", "latin1",         # Windows Western
+        "utf-16", "utf-16le", "utf-16be",
+    ]
+    errors = []
+    for enc in encodings:
+        try:
+            bio = io.BytesIO(file_bytes)
+            # engine='python' is more tolerant of odd delimiters
+            df = pd.read_csv(bio, encoding=enc, engine="python")
+            return df, enc
+        except Exception as e:
+            errors.append(f"{enc}: {e}")
+    raise ValueError("Could not decode CSV with common encodings:\n  " + "\n  ".join(errors))
 
-def import_nonconf_csv(file) -> Tuple[int, List[str]]:
-    df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+def import_nonconf_csv(file) -> tuple[int, list[str]]:
+    """
+    Import non-conformities from CSV or Excel. Auto-detect CSV encodings.
+    Returns (rows_imported, warnings).
+    """
+    # Read into DataFrame (CSV with multi-encoding or Excel)
+    if file.name.lower().endswith(".csv"):
+        raw = file.read()  # bytes
+        df, used_enc = _read_csv_with_encodings(raw)
+        st.toast(f"CSV decoded as {used_enc}", icon="🗂️")
+    else:
+        file.seek(0)
+        df = pd.read_excel(file)  # needs openpyxl
+
     df.columns = [str(c).strip() for c in df.columns]
 
-    col = {k: resolve(df, k) for k in ALIASES.keys()}
-    msgs = []
+    # Use your existing ALIASES + resolve() helpers
+    def resolve(df_: pd.DataFrame, key: str) -> str | None:
+        for cand in ALIASES.get(key, []):
+            if cand in df_.columns:
+                return cand
+        return None
 
+    col = {k: resolve(df, k) for k in ALIASES.keys()}
+    msgs: list[str] = []
     count = 0
+
     for _, r in df.iterrows():
         created = try_parse_date(r.get(col["date"])) or date.today()
+
         payload = {
             "created_at": created.isoformat(),
-            "model_no": str(r.get(col["model_no"])) if col["model_no"] else "",
-            "model_version": str(r.get(col["model_version"])) if col["model_version"] else "",
-            "sn": str(r.get(col["sn"])) if col["sn"] else "",
-            "mo": str(r.get(col["mo"])) if col["mo"] else "",
-            "reporter": str(r.get(col["reporter"])) if col["reporter"] else safe_user(),
-            "nonconformity": str(r.get(col["nonconformity"])) if col["nonconformity"] else "",
-            "description": str(r.get(col["description"])) if col["description"] else "",
-            "type": str(r.get(col["type"])) if col["type"] else "",
+            "model_no":       str(r.get(col["model_no"]))       if col["model_no"]       else "",
+            "model_version":  str(r.get(col["model_version"]))  if col["model_version"]  else "",
+            "sn":             str(r.get(col["sn"]))             if col["sn"]             else "",
+            "mo":             str(r.get(col["mo"]))             if col["mo"]             else "",
+            "reporter":       str(r.get(col["reporter"]))       if col["reporter"]       else safe_user(),
+            "nonconformity":  str(r.get(col["nonconformity"]))  if col["nonconformity"]  else "",
+            "description":    str(r.get(col["description"]))    if col["description"]    else "",
+            "type":           str(r.get(col["type"]))           if col["type"]           else "",
             "image_path": "",
             "images": json.dumps([]),
-            "raw": r.to_json(force_ascii=False),
+            "raw": r.to_json(force_ascii=False),  # keep entire original row
         }
+
         try:
             insert_nonconf(payload)
             count += 1
         except Exception as e:
             msgs.append(f"Row import failed: {e}")
+
+    query_nonconf.clear()  # refresh the results cache
     return count, msgs
 
 # =============================================================================
