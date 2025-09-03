@@ -1,7 +1,4 @@
-# app.py — Quality Portal - Pilot
-# Streamlit 1.36+  |  Python 3.11+
-# Data stored under /mount/data if available, else /tmp/qc_portal
-
+# app.py — Quality Portal - Pilot (safe image rendering)
 import io
 import os
 import json
@@ -35,11 +32,9 @@ def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds")
 
 def current_user() -> str:
-    # Profile name (preferred) -> env -> default
     return st.session_state.get("whoami") or os.getenv("USER") or os.getenv("USERNAME") or "appuser"
 
 def save_image_to(model_no: str, uploaded_file) -> str:
-    """Save file under images/<model_no>/..., return path relative to DATA_DIR"""
     folder = IMG_DIR / (model_no or "_misc")
     folder.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -47,6 +42,20 @@ def save_image_to(model_no: str, uploaded_file) -> str:
     im = Image.open(uploaded_file).convert("RGB")
     im.save(out, "JPEG", quality=90)
     return str(out.relative_to(DATA_DIR))
+
+# SAFE image preview
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+def safe_show_image(path: Path, caption: str | None = None):
+    try:
+        if path and path.is_file() and path.suffix.lower() in IMG_EXTS:
+            st.image(str(path), use_container_width=True, caption=caption)
+        else:
+            # Optional: show a light placeholder so users know no preview is available
+            if caption:
+                st.caption(f"🖼️ {caption}: (no preview)")
+    except Exception as e:
+        st.caption(f"⚠️ Unable to preview image ({e}).")
 
 # --------------------------- Database ---------------------------
 
@@ -81,10 +90,10 @@ SCHEMA = {
             sn TEXT,
             mo TEXT,
             reporter TEXT,
-            severity TEXT,             -- Minor/Major/Critical if you use it
+            severity TEXT,
             description TEXT,
-            image_path TEXT,           -- first/only photo
-            extra JSON                 -- blob for unmapped columns
+            image_path TEXT,
+            extra JSON
         );
     """
 }
@@ -168,7 +177,7 @@ def delete_row(table: str, rid: int):
 st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
 init_db()
 
-# --------------------------- Sidebar (expanders) ---------------------------
+# --------------------------- Sidebar ---------------------------
 
 with st.sidebar:
     st.header("⚙️ Sidebar")
@@ -178,7 +187,7 @@ with st.sidebar:
         if "whoami" not in st.session_state:
             st.session_state.whoami = "appuser"
         st.session_state.whoami = st.text_input("Display name", value=st.session_state.whoami)
-        st.caption("Your name is saved only in this session and used as Reporter.")
+        st.caption("Used as Reporter for new records (imports use this if file omits Reporter).")
 
     # Add / Update Model
     with st.expander("Add / Update Model", expanded=False):
@@ -198,7 +207,7 @@ with st.sidebar:
                         c.commit()
                     st.warning("Model deleted")
 
-    # First Piece entry
+    # Create First Piece
     with st.expander("Create First Piece", expanded=False):
         with st.form("fp_form", clear_on_submit=True):
             fp_model = st.text_input("Model")
@@ -262,9 +271,9 @@ with st.sidebar:
             read_nonconfs.clear()
             st.success("Non-conformity saved")
 
-    # Import Non-Conformities (CSV/XLSX) — **requires click**
+    # Import Non-Conformities (CSV/XLSX) — requires click
     with st.expander("Import Non-Conformities (CSV/XLSX)", expanded=False):
-        st.caption("Columns supported (any order). If a column isn't present it is ignored.")
+        st.caption("If a column is missing it’s ignored; extra columns go to 'extra'.")
         st.code(
             "Nonconformity, Description of Nonconformity, Date, Customer/Supplier, "
             "Model/Part No., MO/PO, Line, Work Station, Unit Head, Responsibility, "
@@ -315,10 +324,7 @@ with st.sidebar:
                     if df is None or df.empty:
                         st.warning("No rows found.")
                     else:
-                        # Normalize headers
                         df.columns = [str(c).strip() for c in df.columns]
-
-                        # Map columns
                         COLS = {
                             "Model/Part No.": "model_no",
                             "MO/PO": "mo",
@@ -340,7 +346,7 @@ with st.sidebar:
                             "Defective Qty": ("extra", "Defective Qty"),
                             "Inspection Qty": ("extra", "Inspection Qty"),
                             "Lot Qty": ("extra", "Lot Qty"),
-                            "Reporter": "reporter",  # if present in file
+                            "Reporter": "reporter",
                             "Severity": "severity"
                         }
 
@@ -381,17 +387,15 @@ with st.sidebar:
                         st.success(f"Imported {n} row(s).")
                         read_nonconfs.clear()
                         st.session_state.nc_last_hash = fhash
-                        # Reset uploader to avoid auto re-trigger on rerun
                         st.session_state.nc_seed += 1
                         st.experimental_rerun()
 
 # --------------------------- Main — Search & View ---------------------------
 
 st.title("🔎 Quality Portal — Pilot")
-
 st.subheader("Search & View")
 
-# Filters (small font, compact height)
+# compact filters
 st.markdown(
     """
     <style>
@@ -404,51 +408,48 @@ st.markdown(
 
 with st.container():
     with st.expander("Filters", expanded=True):
-        with st.container():
-            st.markdown('<div class="smalltxt">', unsafe_allow_html=True)
-            cA, cB, cC, cD, cE, cF = st.columns([1.2,1.2,1.2,1.2,1.2,1.2])
-            with cA:
-                from_dt = st.date_input("Date from", value=None)
-            with cB:
-                to_dt   = st.date_input("Date to", value=None)
-            with cC:
-                model_q = st.text_input("Model contains", key="q_model")
-            with cD:
-                ver_q   = st.text_input("Version contains", key="q_ver")
-            with cE:
-                sn_q    = st.text_input("SN contains", key="q_sn")
-            with cF:
-                mo_q    = st.text_input("MO contains", key="q_mo")
-            t1, t2, t3 = st.columns([1.2,1.2,1.2])
-            with t1:
-                reporter_q = st.text_input("Reporter contains", key="q_rep")
-            with t2:
-                text_q = st.text_input("Text in description/notes", key="q_text")
-            with t3:
-                limit_q = st.number_input("Max rows", 50, 2000, 200, step=50)
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="smalltxt">', unsafe_allow_html=True)
+        cA, cB, cC, cD, cE, cF = st.columns([1.2,1.2,1.2,1.2,1.2,1.2])
+        with cA:
+            from_dt = st.date_input("Date from", value=None)
+        with cB:
+            to_dt   = st.date_input("Date to", value=None)
+        with cC:
+            model_q = st.text_input("Model contains", key="q_model")
+        with cD:
+            ver_q   = st.text_input("Version contains", key="q_ver")
+        with cE:
+            sn_q    = st.text_input("SN contains", key="q_sn")
+        with cF:
+            mo_q    = st.text_input("MO contains", key="q_mo")
+        t1, t2, t3 = st.columns([1.2,1.2,1.2])
+        with t1:
+            reporter_q = st.text_input("Reporter contains", key="q_rep")
+        with t2:
+            text_q = st.text_input("Text in description/notes", key="q_text")
+        with t3:
+            limit_q = st.number_input("Max rows", 50, 2000, 200, step=50)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        # Search trigger (no auto loading)
         c1, c2 = st.columns([1,1])
         with c1:
             run_first = st.button("Search First Piece")
         with c2:
             run_nc = st.button("Search Non-Conformities")
 
-# Build filter dicts
 flt_common = {
     "from": str(from_dt) if isinstance(from_dt, date) else None,
     "to":   str(to_dt) if isinstance(to_dt, date) else None,
-    "model_no": model_q.strip() if model_q else "",
-    "model_version": ver_q.strip() if ver_q else "",
-    "sn": sn_q.strip() if sn_q else "",
-    "mo": mo_q.strip() if mo_q else "",
-    "reporter": reporter_q.strip() if reporter_q else "",
+    "model_no": (model_q or "").strip(),
+    "model_version": (ver_q or "").strip(),
+    "sn": (sn_q or "").strip(),
+    "mo": (mo_q or "").strip(),
+    "reporter": (reporter_q or "").strip(),
 }
 
-# ------------------ Results: First Piece ------------------
+# ------------------ First Piece results ------------------
 if run_first:
-    fp_filters = flt_common | {"note": text_q.strip() if text_q else ""}
+    fp_filters = flt_common | {"note": (text_q or "").strip()}
     df_fp = read_first_piece(fp_filters, int(limit_q))
     st.markdown(f"### 📁 First Piece — {len(df_fp)} record(s)")
     if df_fp.empty:
@@ -460,10 +461,8 @@ if run_first:
                 with cimg:
                     p_top = DATA_DIR / str(r.get("top_image_path") or "")
                     p_bot = DATA_DIR / str(r.get("bottom_image_path") or "")
-                    if p_top.exists():
-                        st.image(str(p_top), use_container_width=True, caption="TOP")
-                    if p_bot.exists():
-                        st.image(str(p_bot), use_container_width=True, caption="BOTTOM")
+                    safe_show_image(p_top, caption="TOP")
+                    safe_show_image(p_bot, caption="BOTTOM")
                 with ctxt:
                     st.markdown(
                         f"**Model:** {r['model_no'] or '-'} | "
@@ -473,18 +472,15 @@ if run_first:
                     st.caption(f"🗓 {r['created_at']}  ·  👤 {r['reporter'] or '-'}")
                     if r.get("note"):
                         st.write(r["note"])
-                    # Add photo to existing record
                     with st.expander("Add photo"):
                         add_top = st.file_uploader("Add TOP", type=["jpg","jpeg","png"], key=f"add_top_{r['id']}")
                         add_bot = st.file_uploader("Add BOTTOM", type=["jpg","jpeg","png"], key=f"add_bot_{r['id']}")
                         if st.button("Upload", key=f"up_{r['id']}"):
                             updates = {}
                             if add_top:
-                                path = save_image_to(r["model_no"], add_top)
-                                updates["top_image_path"] = path
+                                updates["top_image_path"] = save_image_to(r["model_no"], add_top)
                             if add_bot:
-                                path = save_image_to(r["model_no"], add_bot)
-                                updates["bottom_image_path"] = path
+                                updates["bottom_image_path"] = save_image_to(r["model_no"], add_bot)
                             if updates:
                                 with conn() as c:
                                     sets = ", ".join([f"{k}=?" for k in updates])
@@ -498,14 +494,13 @@ if run_first:
                         read_first_piece.clear()
                         st.warning("Deleted. Click search again.")
 
-        # Table & export
         st.markdown("#### Table view & export")
         st.dataframe(df_fp, use_container_width=True, hide_index=True)
         st.download_button("Download CSV", df_fp.to_csv(index=False).encode("utf-8"), "first_piece.csv", "text/csv")
 
-# ------------------ Results: Non-Conformities ------------------
+# ------------------ Non-Conformities results ------------------
 if run_nc:
-    nc_filters = flt_common | {"severity": "", "description": text_q.strip() if text_q else ""}
+    nc_filters = flt_common | {"severity": "", "description": (text_q or "").strip()}
     df_nc = read_nonconfs(nc_filters, int(limit_q))
     st.markdown(f"### 🚩 Non-Conformities — {len(df_nc)} record(s)")
     if df_nc.empty:
@@ -516,8 +511,7 @@ if run_nc:
                 cimg, ctxt = st.columns([2,3])
                 with cimg:
                     p = DATA_DIR / str(r.get("image_path") or "")
-                    if p.exists():
-                        st.image(str(p), use_container_width=True)
+                    safe_show_image(p)
                 with ctxt:
                     st.markdown(
                         f"**Model:** {r['model_no'] or '-'} | "
