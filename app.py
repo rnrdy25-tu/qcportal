@@ -1,13 +1,12 @@
-# QC Portal v2 – Models, First Piece, Non-Conformities, Search & Export
-# Storage is Cloud-safe: /mount/data if available, else /tmp/qc_portal
+# Quality Portal – Pilot
+# Models, First Piece (Top/Bottom), Non-Conformities, Search (with dates) & Export
 
 import os
 import io
 import json
-import zipfile
 import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, time
 
 import streamlit as st
 import pandas as pd
@@ -38,7 +37,6 @@ def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 def current_user() -> str:
-    # Streamlit doesn't provide SSO user by default; we use a simple session signer.
     return st.session_state.get("user_name") or "Admin1"
 
 def is_admin() -> bool:
@@ -47,7 +45,7 @@ def is_admin() -> bool:
 def save_image(model_no: str, uploaded_file) -> str:
     """
     Saves an uploaded image under images/<model_no>/ts_filename.jpg.
-    Returns the path RELATIVE to DATA_DIR (so it’s portable).
+    Returns path RELATIVE to DATA_DIR.
     """
     folder = IMG_DIR / model_no
     folder.mkdir(parents=True, exist_ok=True)
@@ -58,6 +56,16 @@ def save_image(model_no: str, uploaded_file) -> str:
     img.save(out_path, format="JPEG", quality=90)
     return str(out_path.relative_to(DATA_DIR))
 
+def dt_bounds(d_from: date | None, d_to: date | None):
+    """Return (iso_from, iso_to) strings or Nones to filter created_at."""
+    iso_from = None
+    iso_to = None
+    if d_from:
+        iso_from = datetime.combine(d_from, time.min).isoformat(timespec="seconds")
+    if d_to:
+        iso_to = datetime.combine(d_to, time.max).isoformat(timespec="seconds")
+    return iso_from, iso_to
+
 # ========================= Database =========================
 
 SCHEMA_MODELS = """
@@ -67,6 +75,7 @@ CREATE TABLE IF NOT EXISTS models(
 );
 """
 
+# first_piece keeps image_path (for thumbnail) and extra JSON
 SCHEMA_FIRSTPIECE = """
 CREATE TABLE IF NOT EXISTS first_piece(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,8 +86,8 @@ CREATE TABLE IF NOT EXISTS first_piece(
   mo TEXT,
   reporter TEXT,
   description TEXT,
-  image_path TEXT,               -- thumbnail / first image
-  extra JSON                     -- {"images": [...]}
+  image_path TEXT,               -- thumbnail / first image (we use TOP here if present)
+  extra JSON                     -- {"top": "...", "bottom": "..."} or legacy {"images": [...]}
 );
 """
 
@@ -92,10 +101,10 @@ CREATE TABLE IF NOT EXISTS nonconformities(
   line TEXT,
   station TEXT,
   reporter TEXT,
-  category TEXT,                 -- Minor / Major / Critical
-  nc_type TEXT,                  -- Nonconformity type (admin-curated text)
-  description TEXT,              -- free text
-  image_path TEXT,               -- optional main image
+  category TEXT,
+  nc_type TEXT,
+  description TEXT,
+  image_path TEXT,
   extra JSON
 );
 """
@@ -121,11 +130,12 @@ def list_models_df() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_firstpiece_df(
-    model=None, version=None, sn=None, mo=None, text=None, limit=500
+    model=None, version=None, sn=None, mo=None, text=None,
+    d_from=None, d_to=None, limit=500
 ) -> pd.DataFrame:
     q = """
     SELECT id, created_at, model_no, model_version, sn, mo, reporter,
-           description, image_path
+           description, image_path, extra
     FROM first_piece
     WHERE 1=1
     """
@@ -145,6 +155,17 @@ def load_firstpiece_df(
     if text:
         q += " AND (description LIKE ? OR reporter LIKE ?)"
         params.extend([f"%{text}%", f"%{text}%"])
+
+    if d_from and d_to:
+        q += " AND created_at BETWEEN ? AND ?"
+        params.extend([d_from, d_to])
+    elif d_from:
+        q += " AND created_at >= ?"
+        params.append(d_from)
+    elif d_to:
+        q += " AND created_at <= ?"
+        params.append(d_to)
+
     q += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
@@ -153,11 +174,12 @@ def load_firstpiece_df(
 
 @st.cache_data(show_spinner=False)
 def load_nc_df(
-    model=None, version=None, mo=None, text=None, category=None, limit=500
+    model=None, version=None, mo=None, text=None, category=None,
+    d_from=None, d_to=None, limit=500
 ) -> pd.DataFrame:
     q = """
     SELECT id, created_at, model_no, model_version, mo, line, station, reporter,
-           category, nc_type, description, image_path
+           category, nc_type, description, image_path, extra
     FROM nonconformities
     WHERE 1=1
     """
@@ -177,6 +199,17 @@ def load_nc_df(
     if text:
         q += " AND (description LIKE ? OR nc_type LIKE ? OR reporter LIKE ?)"
         params.extend([f"%{text}%", f"%{text}%", f"%{text}%"])
+
+    if d_from and d_to:
+        q += " AND created_at BETWEEN ? AND ?"
+        params.extend([d_from, d_to])
+    elif d_from:
+        q += " AND created_at >= ?"
+        params.append(d_from)
+    elif d_to:
+        q += " AND created_at <= ?"
+        params.append(d_to)
+
     q += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
@@ -241,18 +274,32 @@ def delete_nc(record_id: int):
 # ========================= App UI =========================
 
 init_db()
-st.set_page_config(page_title="QC Portal", layout="wide")
-st.title("🔎 QC Portal — Models, First Piece, Non-Conformities, Search & Export")
+st.set_page_config(page_title="Quality Portal - Pilot", layout="wide")
+
+# small CSS to reduce sizes for this page titles/labels/filters
+st.markdown(
+    """
+    <style>
+      h1, h2 { font-size: 1.65rem; }
+      h3 { font-size: 1.2rem; }
+      div[data-testid="stExpander"] div[role="button"] p { font-size: 0.95rem; }
+      label, .st-emotion-cache-1wbqy5l { font-size: 0.88rem !important; }
+      input, textarea, select { font-size: 0.90rem !important; }
+      .small-note { font-size: 0.85rem; color: #6b7280; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("🔎 Quality Portal - Pilot")
 
 # ---------- Sidebar: Sign in ----------
 with st.sidebar:
     with st.expander("👤 Sign in", expanded=True):
         st.text_input("Your name", key="user_name", value=st.session_state.get("user_name", "Admin1"))
-        st.caption(
-            "This name is saved as **Reporter**. Admin features are enabled for **Admin1**."
-        )
+        st.caption("This name is saved as **Reporter**. Admin features are enabled for **Admin1**.")
 
-# ---------- Sidebar: Models (Admin-friendly) ----------
+# ---------- Sidebar: Models ----------
 with st.sidebar:
     st.header("📚 Models")
     with st.expander("Add / Update Model", expanded=False):
@@ -285,7 +332,7 @@ with st.sidebar:
         else:
             st.dataframe(models_df, use_container_width=True, hide_index=True, height=220)
 
-# ---------- Sidebar: Report First Piece ----------
+# ---------- Sidebar: Report First Piece (Top & Bottom) ----------
 with st.sidebar:
     st.header("📷 First Piece")
     with st.expander("Report new First Piece", expanded=False):
@@ -295,40 +342,32 @@ with st.sidebar:
         fp_mo      = st.text_input("MO / Work Order")
         fp_desc    = st.text_area("Description / Notes")
 
-        up_imgs_fp = st.file_uploader(
-            "Upload photo(s) (Top/Bottom)", type=["jpg","jpeg","png"], accept_multiple_files=True
-        )
+        up_top = st.file_uploader("Upload **TOP** photo", type=["jpg","jpeg","png"], key="fp_top")
+        up_bot = st.file_uploader("Upload **BOTTOM** photo", type=["jpg","jpeg","png"], key="fp_bottom")
+
         if st.button("Save First Piece", use_container_width=True, key="btn_fp_save"):
             if not fp_model.strip():
                 st.error("Model is required.")
-            elif not up_imgs_fp:
-                st.error("Please upload at least one photo.")
+            elif not (up_top or up_bot):
+                st.error("Upload at least one photo (TOP or BOTTOM).")
             else:
-                rel_paths = []
-                for uf in up_imgs_fp:
-                    try:
-                        rel_paths.append(save_image(fp_model.strip(), uf))
-                    except Exception as e:
-                        st.error(f"Failed saving {uf.name}: {e}")
-                        rel_paths = []
-                        break
-                if rel_paths:
-                    payload = {
-                        "created_at": now_iso(),
-                        "model_no": fp_model.strip(),
-                        "model_version": fp_version.strip(),
-                        "sn": fp_sn.strip(),
-                        "mo": fp_mo.strip(),
-                        "reporter": current_user(),
-                        "description": fp_desc.strip(),
-                        "image_path": rel_paths[0],
-                        "extra": json.dumps({"images": rel_paths}, ensure_ascii=False),
-                    }
-                    insert_firstpiece(payload)
-                    st.success("First Piece saved.")
-                    # keep model registry fresh
-                    upsert_model(fp_model.strip(), models_df.set_index("model_no")["name"].get(fp_model.strip(), ""))
-                    load_firstpiece_df.clear()
+                top_rel = save_image(fp_model.strip(), up_top) if up_top else ""
+                bot_rel = save_image(fp_model.strip(), up_bot) if up_bot else ""
+                payload = {
+                    "created_at": now_iso(),
+                    "model_no": fp_model.strip(),
+                    "model_version": fp_version.strip(),
+                    "sn": fp_sn.strip(),
+                    "mo": fp_mo.strip(),
+                    "reporter": current_user(),
+                    "description": fp_desc.strip(),
+                    "image_path": top_rel or bot_rel,  # thumbnail
+                    "extra": json.dumps({"top": top_rel, "bottom": bot_rel}, ensure_ascii=False),
+                }
+                insert_firstpiece(payload)
+                st.success("First Piece saved.")
+                upsert_model(fp_model.strip(), models_df.set_index("model_no")["name"].get(fp_model.strip(), ""))
+                load_firstpiece_df.clear()
 
 # ---------- Sidebar: Report Non-Conformity ----------
 with st.sidebar:
@@ -342,46 +381,38 @@ with st.sidebar:
         nc_category= st.selectbox("Category", ["Minor", "Major", "Critical"], key="nc_cat")
         nc_type    = st.text_input("Nonconformity Type (e.g., Polarity, Short)", key="nc_type")
         nc_desc    = st.text_area("Description of Nonconformity", key="nc_desc")
-        up_imgs_nc = st.file_uploader("Upload photo(s) (optional)", type=["jpg","jpeg","png"], accept_multiple_files=True, key="nc_imgs")
+        up_nc      = st.file_uploader("Upload photo (optional)", type=["jpg","jpeg","png"], key="nc_img")
 
         if st.button("Save Non-Conformity", use_container_width=True, key="btn_nc_save"):
             if not nc_model.strip():
                 st.error("Model is required.")
             else:
-                rel_paths = []
-                for uf in (up_imgs_nc or []):
-                    try:
-                        rel_paths.append(save_image(nc_model.strip(), uf))
-                    except Exception as e:
-                        st.error(f"Failed saving {uf.name}: {e}")
-                        rel_paths = []
-                        break
-                if rel_paths or not up_imgs_nc:
-                    payload = {
-                        "created_at": now_iso(),
-                        "model_no": nc_model.strip(),
-                        "model_version": nc_version.strip(),
-                        "mo": nc_mo.strip(),
-                        "line": nc_line.strip(),
-                        "station": nc_station.strip(),
-                        "reporter": current_user(),
-                        "category": nc_category,
-                        "nc_type": nc_type.strip(),
-                        "description": nc_desc.strip(),
-                        "image_path": rel_paths[0] if rel_paths else "",
-                        "extra": json.dumps({"images": rel_paths}, ensure_ascii=False),
-                    }
-                    insert_nc(payload)
-                    st.success("Non-Conformity saved.")
-                    upsert_model(nc_model.strip(), models_df.set_index("model_no")["name"].get(nc_model.strip(), ""))
-                    load_nc_df.clear()
+                rel = save_image(nc_model.strip(), up_nc) if up_nc else ""
+                payload = {
+                    "created_at": now_iso(),
+                    "model_no": nc_model.strip(),
+                    "model_version": nc_version.strip(),
+                    "mo": nc_mo.strip(),
+                    "line": nc_line.strip(),
+                    "station": nc_station.strip(),
+                    "reporter": current_user(),
+                    "category": nc_category,
+                    "nc_type": nc_type.strip(),
+                    "description": nc_desc.strip(),
+                    "image_path": rel,
+                    "extra": json.dumps({}, ensure_ascii=False),
+                }
+                insert_nc(payload)
+                st.success("Non-Conformity saved.")
+                upsert_model(nc_model.strip(), models_df.set_index("model_no")["name"].get(nc_model.strip(), ""))
+                load_nc_df.clear()
 
 # ========================= MAIN: Search & Results =========================
 
-st.subheader("🔍 Search & View")
+st.markdown("### 🔍 Search & View  <span class='small-note'>use filters below</span>", unsafe_allow_html=True)
 
 with st.expander("Filters", expanded=True):
-    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,2])
+    c1, c2, c3, c4, c5, c6, c7 = st.columns([1,1,1,1,2,1,1])
     with c1:
         q_model = st.text_input("Model contains", key="q_model")
     with c2:
@@ -392,8 +423,15 @@ with st.expander("Filters", expanded=True):
         q_mo = st.text_input("MO contains", key="q_mo")
     with c5:
         q_text = st.text_input("Text in description/reporter/type", key="q_text")
+    with c6:
+        q_from = st.date_input("Date from", key="q_from", value=None)
+    with c7:
+        q_to = st.date_input("Date to", key="q_to", value=None)
 
 tabs = st.tabs(["📷 First Piece (results)", "🛠️ Non-Conformities (results)"])
+
+iso_from, iso_to = dt_bounds(q_from if isinstance(q_from, date) else None,
+                             q_to   if isinstance(q_to, date)   else None)
 
 # ---------- First Piece results ----------
 with tabs[0]:
@@ -403,19 +441,43 @@ with tabs[0]:
         sn=q_sn or None,
         mo=q_mo or None,
         text=q_text or None,
+        d_from=iso_from,
+        d_to=iso_to,
     )
     st.caption(f"{len(fdf)} record(s)")
 
     for _, r in fdf.iterrows():
+        # Parse extra for top/bottom, stay backward-compatible
+        extra = {}
+        try:
+            extra = json.loads(r.get("extra") or "{}")
+        except Exception:
+            extra = {}
+        top_rel = extra.get("top")
+        bot_rel = extra.get("bottom")
+
+        # legacy fallback: extra["images"] list
+        if not (top_rel or bot_rel):
+            imgs = extra.get("images", [])
+            if isinstance(imgs, list):
+                if len(imgs) >= 1: top_rel = imgs[0]
+                if len(imgs) >= 2: bot_rel = imgs[1]
+
         with st.container(border=True):
-            cols = st.columns([1, 3])
+            cols = st.columns([1, 1, 3])   # show TOP & BOTTOM side-by-side
             with cols[0]:
-                p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
-                if p and p.exists():
-                    st.image(str(p), use_column_width=True)
+                p_top = DATA_DIR / str(top_rel) if top_rel else None
+                if p_top and p_top.exists():
+                    st.image(str(p_top), use_container_width=True, caption="TOP")
                 else:
-                    st.caption("No image")
+                    st.caption("No TOP")
             with cols[1]:
+                p_bot = DATA_DIR / str(bot_rel) if bot_rel else None
+                if p_bot and p_bot.exists():
+                    st.image(str(p_bot), use_container_width=True, caption="BOTTOM")
+                else:
+                    st.caption("No BOTTOM")
+            with cols[2]:
                 st.markdown(
                     f"**Model:** {r.get('model_no','-')}  |  "
                     f"**Version:** {r.get('model_version','-')}  |  "
@@ -433,7 +495,7 @@ with tabs[0]:
                         st.experimental_rerun()
 
     with st.expander("Table • Export", expanded=False):
-        st.dataframe(fdf, use_container_width=True, hide_index=True)
+        st.dataframe(fdf.drop(columns=["extra"], errors="ignore"), use_container_width=True, hide_index=True)
         csv = fdf.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="first_piece_results.csv", mime="text/csv")
 
@@ -446,6 +508,8 @@ with tabs[1]:
         mo=q_mo or None,
         text=q_text or None,
         category=c_cat,
+        d_from=iso_from,
+        d_to=iso_to,
     )
     st.caption(f"{len(ndf)} record(s)")
 
@@ -455,7 +519,7 @@ with tabs[1]:
             with cols[0]:
                 p = DATA_DIR / str(r.get("image_path","")) if r.get("image_path") else None
                 if p and p.exists():
-                    st.image(str(p), use_column_width=True)
+                    st.image(str(p), use_container_width=True)
                 else:
                     st.caption("No image")
             with cols[1]:
@@ -478,6 +542,6 @@ with tabs[1]:
                         st.experimental_rerun()
 
     with st.expander("Table • Export", expanded=False):
-        st.dataframe(ndf, use_container_width=True, hide_index=True)
+        st.dataframe(ndf.drop(columns=["extra"], errors="ignore"), use_container_width=True, hide_index=True)
         csv = ndf.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="nonconformities_results.csv", mime="text/csv")
