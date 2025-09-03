@@ -62,7 +62,7 @@ if u is not None:
         out = IMG_DIR / f"smoketest_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.jpg"
         img.save(out, format="JPEG", quality=90)
         st.success(f"Saved image to: {out}")
-        st.image(str(out), caption="Saved image preview", use_container_width=True)
+        st.image(str(out), caption="Saved image preview")  # no extra args
     except Exception as e:
         st.error(f"Image save FAILED: {e}")
 
