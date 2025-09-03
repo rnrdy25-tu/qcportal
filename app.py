@@ -548,15 +548,18 @@ with st.expander("📁 First Piece (results)", expanded=True):
                 load_firstpiece_df.clear()
                 st.experimental_rerun()
 
-# NON-CONFORMITIES results
+# ─────────── NON-CONFORMITIES results ───────────
+
+# 1) Build dataframe once (outside of any expander)
+ndf = load_nonconf_df(
+    model=f_model or None, version=f_ver or None, sn=f_sn or None, mo=f_mo or None,
+    text=f_text or None, date_from=f_from or None, date_to=f_to or None
+)
+
+# 2) Cards view
 with st.expander("📁 Non-Conformities (results)", expanded=True):
-    ndf = load_nonconf_df(
-        model=f_model or None, version=f_ver or None, sn=f_sn or None, mo=f_mo or None,
-        text=f_text or None, date_from=f_from or None, date_to=f_to or None
-    )
     st.caption(f"{len(ndf)} record(s)")
 
-    # Cards
     for _, r in ndf.iterrows():
         with st.container():
             st.markdown(
@@ -569,13 +572,13 @@ with st.expander("📁 Non-Conformities (results)", expanded=True):
             )
             st.markdown(f"<span class='muted'>{meta}</span>", unsafe_allow_html=True)
 
-            cimg, ctxt = st.columns([1,2])
+            cimg, ctxt = st.columns([1, 2])
             with cimg:
                 pp = _path_if_exists(r.get("photo_path"))
                 if pp:
                     st.image(str(pp), use_container_width=True)
                 else:
-                    up = st.file_uploader(" + Photo", type=["jpg","jpeg","png"], key=f"addph_{r['id']}")
+                    up = st.file_uploader(" + Photo", type=["jpg", "jpeg", "png"], key=f"addph_{r['id']}")
                     if up is not None:
                         rel = _save_image("nonconf", r.get("model_no") or "unknown", up)
                         update_nonconf_photo(int(r["id"]), rel)
@@ -583,8 +586,9 @@ with st.expander("📁 Non-Conformities (results)", expanded=True):
                         st.experimental_rerun()
 
             with ctxt:
-                # show all important fields (and anything else in extra JSON)
-                lines = [
+                if r.get("description"):
+                    st.write(r["description"])
+                for label, val in [
                     ("Type", r.get("nc_type")),
                     ("Customer", r.get("customer")),
                     ("Line", r.get("line")),
@@ -598,20 +602,26 @@ with st.expander("📁 Non-Conformities (results)", expanded=True):
                     ("Defective Qty", r.get("defect_qty")),
                     ("Inspection Qty", r.get("inspection_qty")),
                     ("Lot Qty", r.get("lot_qty")),
-                ]
-                if r.get("description"):
-                    st.write(r["description"])
-                for label, val in lines:
+                ]:
                     if val:
                         st.caption(f"**{label}:** {val}")
 
-            cact1, cact2 = st.columns([1,8])
-            with cact1:
-                if st.button("Delete", key=f"del_nc_{r['id']}"):
-                    delete_nonconf(int(r["id"]))
-                    load_nonconf_df.clear()
-                    st.experimental_rerun()
+            if st.button("Delete", key=f"del_nc_{r['id']}"):
+                delete_nonconf(int(r["id"]))
+                load_nonconf_df.clear()
+                st.experimental_rerun()
 
+# 3) Separate expander for table + export (NOT nested)
+with st.expander("Table view & export", expanded=False):
+    st.dataframe(ndf, use_container_width=True, hide_index=True)
+    csv = ndf.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Download CSV",
+        data=csv,
+        file_name="nonconformities_export.csv",
+        mime="text/csv"
+    )
+    
     # Table + Export
     with st.expander("Table view & export"):
         st.dataframe(ndf, use_container_width=True, hide_index=True)
