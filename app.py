@@ -6,13 +6,23 @@ from datetime import datetime
 import streamlit as st
 from PIL import Image
 
-# --- Writable paths on Streamlit Cloud (works locally too) ---
-DATA_DIR = Path("/mount/data")
+# --- pick a writable base directory (Cloud-safe) ---
+def pick_data_dir() -> Path:
+    for base in (Path("/mount/data"), Path("/tmp/qc_portal")):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            # quick write test
+            (base / ".write_test").write_text("ok", encoding="utf-8")
+            return base
+        except Exception:
+            pass
+    raise RuntimeError("No writable directory found")
+
+DATA_DIR = pick_data_dir()
 IMG_DIR  = DATA_DIR / "images"
 DB_PATH  = DATA_DIR / "qc_portal.sqlite3"
 
-for p in [DATA_DIR, IMG_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
+IMG_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="QC Portal • Smoke Test", layout="centered")
 st.title("✅ QC Portal — Smoke Test")
